@@ -1,0 +1,5 @@
+client,address,service_date,preferred_day,flexible_days,time_window,earliest_start,latest_finish,job_hours,cleaning_type,can_shift,frequency,job_price,preferred_resource,lock_resource,priority,risk_level,buffer_minutes,min_workers,max_workers,requires_team,notes
+Carrie Herbeck,"New Prague, MN",,Wednesday,"Tuesday,Wednesday,Thursday",Flexible,08:30,17:00,4,Standard,Yes,Biweekly,270,,No,High,Medium,,1,2,No,Sample recurring client
+Dan Konicek,"Eagan, MN",,Thursday,"Wednesday,Thursday",Morning,08:30,12:30,3,Deep Cleaning,Yes,Monthly,330,Klarisa,No,Normal,High,,1,2,No,Sample deep clean
+Lakeville Client,"Lakeville, MN",,Tuesday,"Tuesday,Thursday",Flexible,08:30,17:00,2.5,Standard,Yes,One time,205,Chloe,Yes,VIP,Low,,1,1,No,Locked cleaner example
+Move Out Example,"Burnsville, MN",,Friday,"Thursday,Friday",Flexible,08:30,17:00,7,Move Out,Yes,One time,520,Isabel/Jacky,No,High,High,,2,2,Yes,Requires team

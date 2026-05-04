@@ -1,0 +1,3 @@
+resource_name,members,team_type,available_days,base_address,can_split_after_job,always_together,carpool,max_jobs_per_day,max_hours_per_day,start_time,end_time,productivity_multiplier,hourly_cost_override
+Isabel/Jacky,"Isabel;Jacky",Fixed,"Monday,Tuesday,Wednesday,Thursday,Friday","Burnsville, MN",No,Yes,Yes,4,8,08:30,17:00,2,
+Billy/Eduardo,"Billy;Eduardo",Optional,"Monday,Tuesday,Wednesday,Thursday,Friday","St. Louis Park, MN",Yes,No,Yes,3,8,08:30,17:00,2,

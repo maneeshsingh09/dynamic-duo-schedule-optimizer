@@ -1,0 +1,7 @@
+cleaner,base_address,available_days,max_jobs_per_day,max_hours_per_day,start_time,end_time,hourly_cost,allow_solo
+Isabel,"Burnsville, MN","Monday,Tuesday,Wednesday,Thursday,Friday",4,8,08:30,17:00,23,No
+Jacky,"Burnsville, MN","Monday,Tuesday,Wednesday,Thursday,Friday",4,8,08:30,17:00,23,No
+Billy,"Belle Plaine, MN","Monday,Tuesday,Wednesday,Thursday,Friday",3,8,08:30,17:00,22,Yes
+Eduardo,"St. Louis Park, MN","Monday,Tuesday,Wednesday,Thursday,Friday",3,8,08:30,17:00,24,Yes
+Klarisa,"Eagan, MN","Monday,Tuesday,Wednesday,Thursday,Friday",3,8,08:30,17:00,40,Yes
+Chloe,"Apple Valley, MN","Monday,Tuesday,Wednesday,Thursday,Friday",3,8,08:30,17:00,22,Yes

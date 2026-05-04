@@ -1,0 +1,2 @@
+customer_full_name,appointment_address,booking_start_date,preferred_day,flexible_days,arrival_window,estimated_hours,service_type,can_move,frequency,appointment_total,assigned_cleaner,must_keep_cleaner,priority,risk_level,min_workers,max_workers,team_required,notes
+Example Customer,"Eagan, MN",2026-05-06,Wednesday,"Tuesday,Wednesday,Thursday",Flexible,3,Standard,Yes,Biweekly,220,Chloe,No,Normal,Medium,1,2,No,
