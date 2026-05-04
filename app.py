@@ -1324,12 +1324,29 @@ def add_manager_review_columns(schedule: pd.DataFrame) -> pd.DataFrame:
 
 
 def apply_review_status_to_schedule(schedule: pd.DataFrame, reviewed_subset: pd.DataFrame) -> pd.DataFrame:
+    """Apply manager review edits back to the full schedule.
+
+    Streamlit's data_editor can return duplicate instance_id rows in some cases
+    (for example after sorting/filtering/reruns or duplicated uploaded bookings).
+    Pandas requires a unique index for to_dict(orient="index"), so we keep the
+    last edited row for each instance_id before building the lookup map.
+    """
     if schedule is None or schedule.empty or reviewed_subset is None or reviewed_subset.empty or "instance_id" not in reviewed_subset.columns:
         return add_manager_review_columns(schedule)
+
     out = add_manager_review_columns(schedule)
-    status_map = reviewed_subset.set_index("instance_id")[[c for c in ["manager_status", "lock_assignment", "manager_note"] if c in reviewed_subset.columns]].to_dict("index")
+    editable_cols = [c for c in ["manager_status", "lock_assignment", "manager_note"] if c in reviewed_subset.columns]
+    if not editable_cols:
+        return out
+
+    subset = reviewed_subset[["instance_id"] + editable_cols].copy()
+    subset["instance_id"] = subset["instance_id"].astype(str)
+    subset = subset[subset["instance_id"].notna() & (subset["instance_id"].str.strip() != "")]
+    subset = subset.drop_duplicates(subset=["instance_id"], keep="last")
+
+    status_map = subset.set_index("instance_id")[editable_cols].to_dict("index")
     for idx, row in out.iterrows():
-        iid = row.get("instance_id")
+        iid = str(row.get("instance_id"))
         if iid in status_map:
             for col, val in status_map[iid].items():
                 out.at[idx, col] = val
