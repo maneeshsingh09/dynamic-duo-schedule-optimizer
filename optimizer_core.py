@@ -799,8 +799,18 @@ def compute_legacy_distance_matrix(points: List[Dict[str, Any]], api_key: str, c
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 8)
 def compute_route_matrix(points: List[Dict[str, Any]], api_key: str, use_google: bool, provider: str = "Auto", chunk_size: int = 20) -> Tuple[List[List[float]], List[List[float]], str]:
-    if not use_google or not api_key:
+    """Return driving matrix and a compact source label.
+
+    v11 keeps the interface clean: if Google rejects the key, we do not dump the full
+    error into the main app. The detailed reason is stored in session_state for the
+    Google routing help expander.
+    """
+    if not use_google or not api_key or provider == "Approximate only":
         m, t = approximate_route_matrix(points)
+        try:
+            st.session_state["last_google_routing_error"] = ""
+        except Exception:
+            pass
         return m, t, "Approximate fallback"
 
     provider = provider or "Auto"
@@ -810,6 +820,10 @@ def compute_route_matrix(points: List[Dict[str, Any]], api_key: str, use_google:
     if provider in ["Auto", "Routes API"]:
         try:
             m, t = compute_routes_api_matrix(points, api_key, chunk_size=chunk_size)
+            try:
+                st.session_state["last_google_routing_error"] = ""
+            except Exception:
+                pass
             return m, t, "Google Routes API"
         except Exception as exc:
             routes_error = str(exc)
@@ -817,8 +831,10 @@ def compute_route_matrix(points: List[Dict[str, Any]], api_key: str, use_google:
     if provider in ["Auto", "Distance Matrix API (Legacy)"]:
         try:
             m, t = compute_legacy_distance_matrix(points, api_key, chunk_size=10)
-            if routes_error:
-                st.info("Routes API did not work, so the app used Distance Matrix API (Legacy) as backup.")
+            try:
+                st.session_state["last_google_routing_error"] = ""
+            except Exception:
+                pass
             return m, t, "Google Distance Matrix API (Legacy)"
         except Exception as exc:
             legacy_error = str(exc)
@@ -827,11 +843,22 @@ def compute_route_matrix(points: List[Dict[str, Any]], api_key: str, use_google:
     if routes_error:
         details.append(f"Routes API: {routes_error}")
     if legacy_error:
-        details.append(f"Distance Matrix API (Legacy): {legacy_error}")
+        details.append(f"Distance Matrix API: {legacy_error}")
     details_txt = " | ".join(details) or "Unknown Google Maps error"
-    st.warning(f"Google routing failed, using approximate fallback instead. Details: {details_txt}")
+    try:
+        st.session_state["last_google_routing_error"] = details_txt
+    except Exception:
+        pass
+
+    # Compact label shown in the schedule. Detailed setup help lives in the app UI.
+    label = "Approximate fallback — Google routing key blocked"
+    if "REQUEST_DENIED" in details_txt or "not authorized" in details_txt:
+        label = "Approximate fallback — API key not authorized"
+    elif "API_KEY_SERVICE_BLOCKED" in details_txt or "blocked" in details_txt.lower():
+        label = "Approximate fallback — API service blocked on key"
+
     m, t = approximate_route_matrix(points)
-    return m, t, "Approximate fallback"
+    return m, t, label
 
 # -----------------------------
 # Resource, recurrence, and optimization
@@ -1791,367 +1818,3 @@ def default_exceptions() -> pd.DataFrame:
     return pd.DataFrame([
         {"cleaner": "Klarisa", "date": "", "day": "", "status": "", "available_start": "", "available_end": "", "reason": ""},
     ])
-
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-
-def main() -> None:
-    st.set_page_config(page_title=APP_TITLE, layout="wide")
-    st.title(APP_TITLE)
-    st.caption("Easy weekly route planning for cleaners, crews, recurring clients, emergencies, and profit-aware scheduling.")
-
-    with st.sidebar:
-        st.header("Setup")
-        api_key_default = get_secret_value("GOOGLE_MAPS_API_KEY")
-        api_key = st.text_input("Google Maps API key", value=api_key_default, type="password", help="Optional for testing. Without it, the app uses approximate demo distances.")
-        use_google = st.checkbox("Use Google driving routes", value=bool(api_key_default), help="Turn off while testing to avoid API usage.")
-        routing_provider = st.selectbox("Google routing provider", ["Auto", "Routes API", "Distance Matrix API (Legacy)", "Approximate only"], index=0, help="Use Auto first. If Routes API keeps giving 403, enable Distance Matrix API (Legacy) in Google Cloud and choose that provider.")
-        if routing_provider == "Approximate only":
-            use_google = False
-        week_start = st.date_input("Week start", value=date.today())
-        horizon_weeks = st.slider("Planning horizon", 1, 8, 2, help="Use 4-8 weeks to catch recurring conflicts before they happen.")
-        include_weekends = st.checkbox("Include weekends", value=False)
-        hours_are_person_hours = st.checkbox("Job hours are one-person hours", value=True, help="If checked, a 4-hour job with 2 cleaners becomes about 2 hours plus buffer.")
-        mileage_cost = st.number_input("Mileage cost per mile", value=0.67, min_value=0.0, step=0.05)
-        travel_hour_cost = st.number_input("Travel time cost per hour", value=15.0, min_value=0.0, step=1.0)
-        min_profit = st.number_input("Minimum target profit per job", value=70.0, min_value=0.0, step=10.0)
-        long_drive_miles = st.number_input("Bad route warning if drive leg exceeds miles", value=22.0, min_value=1.0, step=1.0)
-
-        st.divider()
-        st.header("Shared master data")
-        sheet_id_default = get_google_sheet_id()
-        sheet_id = st.text_input("Google Sheet ID", value=sheet_id_default, type="password", help="Optional. Store this in Streamlit secrets for production.")
-        sheets_ok, sheets_msg = google_sheets_configured(sheet_id)
-        use_google_sheets_master = st.checkbox(
-            "Use Google Sheets shared data",
-            value=sheets_ok,
-            help="If checked, the app reads Cleaners, Crew Rules, Availability Exceptions, Area Memory, Actual Time History, and Active Bookings from the shared Sheet unless you upload a CSV override.",
-        )
-        if use_google_sheets_master:
-            if sheets_ok:
-                st.success("Google Sheets shared data ready")
-            else:
-                st.warning(sheets_msg)
-
-    st.markdown("### Weekly BookingKoala/GHL upload + shared active week")
-    st.write("Upload the current week from BookingKoala/GHL. You can save that upload as the shared Active Week in Google Sheets so both admins load the same bookings without uploading again.")
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    with c1:
-        cleaners_file = st.file_uploader("Cleaners CSV override", type=["csv"], key="cleaners")
-    with c2:
-        bookings_file = st.file_uploader("BookingKoala/GHL bookings CSV", type=["csv"], key="bookings")
-    with c3:
-        crew_file = st.file_uploader("Crew rules CSV override", type=["csv"], key="crews")
-    with c4:
-        exceptions_file = st.file_uploader("Day off / emergency CSV override", type=["csv"], key="exceptions")
-    with c5:
-        area_file = st.file_uploader("Area memory CSV override", type=["csv"], key="area")
-    with c6:
-        actuals_file = st.file_uploader("Actual time history CSV override", type=["csv"], key="actuals")
-
-    st.divider()
-    st.subheader("Shared Active Week")
-    aw1, aw2, aw3 = st.columns([1.4, 1.2, 1.4])
-    with aw1:
-        uploaded_by = st.text_input("Admin name / initials", value="", help="Used only for the Active Week upload log.")
-    with aw2:
-        st.caption("Current planning window")
-        st.write(f"{week_start.isoformat()} → {(week_start + timedelta(days=(7 * int(horizon_weeks)) - 1)).isoformat()}")
-    with aw3:
-        if bookings_file is None:
-            st.info("No bookings CSV uploaded. If Google Sheets is connected, the app will load the shared Active Bookings tab.")
-        elif use_google_sheets_master and google_sheets_configured(sheet_id)[0]:
-            uploaded_bookings_preview = read_uploaded_csv(bookings_file)
-            st.success(f"Uploaded {len(uploaded_bookings_preview)} booking row(s) for this run.")
-            if st.button("Save uploaded CSV as Active Week for both admins", type="primary"):
-                active_bookings = stamp_active_bookings(uploaded_bookings_preview, week_start, horizon_weeks, include_weekends, uploaded_by)
-                meta = make_active_week_metadata(week_start, horizon_weeks, include_weekends, uploaded_by, len(active_bookings))
-                msg1 = write_google_tab(sheet_id, MASTER_SHEET_TABS["bookings"], active_bookings)
-                msg2 = write_google_tab(sheet_id, MASTER_SHEET_TABS["active_meta"], meta)
-                st.success(msg1)
-                st.success(msg2)
-                st.info("The other admin can now open the app, keep the bookings uploader empty, and load the same Active Week from Google Sheets.")
-        else:
-            st.warning("Connect Google Sheets to save this upload as the shared Active Week. The CSV will still work for your current session.")
-
-    if use_google_sheets_master and google_sheets_configured(sheet_id)[0]:
-        active_meta_df, active_meta_status = read_google_tab(sheet_id, MASTER_SHEET_TABS["active_meta"], pd.DataFrame())
-        if not active_meta_df.empty and set(["field", "value"]).issubset(active_meta_df.columns):
-            meta_dict = dict(zip(active_meta_df["field"], active_meta_df["value"]))
-            st.caption(
-                "Active Week in Google Sheets: "
-                f"{meta_dict.get('active_week_start', 'unknown')} → {meta_dict.get('active_week_end', 'unknown')} "
-                f"| uploaded by {meta_dict.get('uploaded_by', 'Admin')} "
-                f"| rows: {meta_dict.get('row_count', '0')}"
-            )
-
-    try:
-        files = {"cleaners": cleaners_file, "bookings": bookings_file, "crews": crew_file, "exceptions": exceptions_file, "area": area_file, "actuals": actuals_file}
-        master_data, load_statuses = load_master_data(sheet_id, use_google_sheets_master, files)
-        cleaners_raw = master_data["cleaners"]
-        bookings_raw = master_data["bookings"]
-        crews_raw = master_data["crews"]
-        exceptions_raw = master_data["exceptions"]
-        area_raw = master_data["area"]
-        actuals_raw = master_data["actuals"]
-        with st.expander("Data source status", expanded=False):
-            for status in load_statuses:
-                st.write("- " + status)
-
-        # Quick emergency override.
-        with st.expander("Quick emergency / day-off override"):
-            e1, e2, e3, e4 = st.columns(4)
-            with e1:
-                emergency_cleaner = st.selectbox("Cleaner/resource", [""] + list(cleaners_raw.get("cleaner", pd.Series(dtype=str)).astype(str)) + list(crews_raw.get("resource_name", pd.Series(dtype=str)).astype(str)))
-            with e2:
-                emergency_date = st.date_input("Affected date", value=week_start, key="emergency_date")
-            with e3:
-                emergency_type = st.selectbox("Status", ["None", "Full day off / emergency", "Morning off", "Afternoon off", "Custom hours"])
-            with e4:
-                reason = st.text_input("Reason/note", value="Emergency override")
-            custom_start, custom_end = "", ""
-            if emergency_type == "Custom hours":
-                cc1, cc2 = st.columns(2)
-                with cc1:
-                    custom_start = st.text_input("Available start", value="12:00")
-                with cc2:
-                    custom_end = st.text_input("Available end", value="17:00")
-            if emergency_cleaner and emergency_type != "None":
-                if emergency_type == "Full day off / emergency":
-                    row = {"cleaner": emergency_cleaner, "date": emergency_date.isoformat(), "day": "", "status": "Emergency", "available_start": "", "available_end": "", "reason": reason}
-                elif emergency_type == "Morning off":
-                    row = {"cleaner": emergency_cleaner, "date": emergency_date.isoformat(), "day": "", "status": "Half Day", "available_start": "12:00", "available_end": DEFAULT_END, "reason": reason}
-                elif emergency_type == "Afternoon off":
-                    row = {"cleaner": emergency_cleaner, "date": emergency_date.isoformat(), "day": "", "status": "Half Day", "available_start": DEFAULT_START, "available_end": "12:30", "reason": reason}
-                else:
-                    row = {"cleaner": emergency_cleaner, "date": emergency_date.isoformat(), "day": "", "status": "Custom", "available_start": custom_start, "available_end": custom_end, "reason": reason}
-                exceptions_raw = pd.concat([exceptions_raw, pd.DataFrame([row])], ignore_index=True)
-                st.success("Emergency override added to this optimization run.")
-
-        cleaners = prepare_cleaners(cleaners_raw)
-        bookings = prepare_bookings(bookings_raw)
-        actuals = prepare_actuals(actuals_raw)
-        bookings, time_learning = apply_actual_time_learning(bookings, actuals)
-        crews = prepare_crew_rules(crews_raw)
-        exceptions = prepare_availability_exceptions(exceptions_raw)
-        area_memory = prepare_area_memory(area_raw)
-        resources, resource_lookup = build_resources(cleaners, crews)
-        dates = week_dates(week_start, horizon_weeks, include_weekends)
-        booking_instances = expand_recurring_bookings(bookings, dates)
-
-        if booking_instances.empty:
-            st.warning("No bookings found inside this planning horizon.")
-            return
-
-        with st.spinner("Preparing locations and optimizing schedule..."):
-            points, point_idx, points_df = make_points(resources, booking_instances, api_key, use_google)
-            miles_matrix, minutes_matrix, route_source = compute_route_matrix(points, api_key, use_google, routing_provider)
-            schedule, unassigned, alerts, schedules_dict, member_events = optimize_schedule(
-                booking_instances, resources, dates, exceptions, miles_matrix, minutes_matrix, point_idx,
-                area_memory, hours_are_person_hours, mileage_cost, travel_hour_cost,
-            )
-            price_suggestions = price_adjustment_suggestions(schedule, min_profit, long_drive_miles)
-            move_messages = build_move_message_suggestions(schedule, price_suggestions)
-            rescue = emergency_rescue_suggestions(unassigned, alerts, schedule)
-            texts = build_daily_text(schedule)
-
-        st.success(f"Optimization completed using {route_source}.")
-
-        k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("Scheduled jobs", len(schedule))
-        k2.metric("Unassigned", len(unassigned))
-        k3.metric("Alerts", len(alerts))
-        k4.metric("Resources", len(resources))
-        total_miles = float(schedule["travel_miles"].astype(float).sum()) if not schedule.empty else 0.0
-        k5.metric("Drive miles before jobs", f"{total_miles:.1f}")
-
-        reviewed_schedule = add_manager_review_columns(schedule)
-        approved_schedule, rejected_schedule, needs_review_schedule = split_reviewed_schedule(reviewed_schedule)
-
-        tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
-            "Review + schedule", "Crews/resources", "New booking checker", "Alerts + emergency", "Map", "Cleaner texts", "Exports", "Templates"
-        ])
-
-        with tab1:
-            display_cols = ["manager_status", "lock_assignment", "manager_note", "date", "day", "resource", "resource_type", "members", "start", "end", "client", "city", "cleaning_type", "priority", "duration_hours", "travel_miles", "travel_minutes", "profit_score", "buffer_mins", "time_learning_note", "score_notes", "instance_id"]
-            review_cols = [c for c in display_cols if c in reviewed_schedule.columns]
-            st.subheader("Manager approval")
-            st.caption("Review the recommended schedule, then approve, lock, reject, or mark rows for manual review before exporting.")
-            if reviewed_schedule.empty:
-                st.info("No scheduled jobs yet.")
-            else:
-                reviewed_subset = st.data_editor(
-                    reviewed_schedule[review_cols],
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "manager_status": st.column_config.SelectboxColumn("Status", options=["Approve", "Lock", "Needs Review", "Reject"], required=True),
-                        "lock_assignment": st.column_config.CheckboxColumn("Lock"),
-                        "manager_note": st.column_config.TextColumn("Manager note"),
-                    },
-                    disabled=[c for c in review_cols if c not in {"manager_status", "lock_assignment", "manager_note"}],
-                    key="manager_review_editor",
-                )
-                reviewed_schedule = apply_review_status_to_schedule(schedule, reviewed_subset)
-                approved_schedule, rejected_schedule, needs_review_schedule = split_reviewed_schedule(reviewed_schedule)
-                a1, a2, a3 = st.columns(3)
-                a1.metric("Approved/locked", len(approved_schedule))
-                a2.metric("Needs review", len(needs_review_schedule))
-                a3.metric("Rejected", len(rejected_schedule))
-                display_df("Final approved schedule for export", approved_schedule[[c for c in display_cols if c in approved_schedule.columns]].drop(columns=["instance_id"], errors="ignore"))
-                display_df("Rejected / manual review rows", pd.concat([rejected_schedule, needs_review_schedule], ignore_index=True)[[c for c in display_cols if c in reviewed_schedule.columns]].drop(columns=["instance_id"], errors="ignore") if (not rejected_schedule.empty or not needs_review_schedule.empty) else pd.DataFrame())
-            display_df("Unassigned / needs manual review", unassigned)
-            display_df("Actual-vs-estimated learning applied", time_learning)
-
-        with tab2:
-            display_df("Available resources created from cleaners + crew rules", resources.drop(columns=["member_keys"], errors="ignore"))
-            st.info("Fixed crews, like Isabel/Jacky, are treated as one route resource. Optional crews, like Billy/Eduardo, can be used when it helps, while the app prevents overlapping schedules for the same person.")
-
-        with tab3:
-            st.subheader("New booking checker")
-            st.write("Use this before confirming a new job. It checks where the new client fits best against the already optimized schedule.")
-            n1, n2, n3, n4 = st.columns(4)
-            with n1:
-                nb_client = st.text_input("Client name", value="New Lead")
-                nb_address = st.text_input("Address/city", value="Lakeville, MN")
-            with n2:
-                nb_type = st.selectbox("Cleaning type", ["Standard", "Deep Cleaning", "Move Out", "Airbnb"])
-                nb_hours = st.number_input("One-person job hours", value=3.0, min_value=0.5, step=0.5)
-            with n3:
-                nb_price = st.number_input("Quoted price", value=240.0, min_value=0.0, step=10.0)
-                nb_days = st.text_input("Flexible days", value="Tuesday,Wednesday,Thursday")
-            with n4:
-                nb_window = st.selectbox("Time window", ["Flexible", "Morning", "Afternoon", "Fixed"])
-                nb_priority = st.selectbox("Priority", ["VIP", "High", "Normal", "Low"], index=2)
-            if st.button("Check best fit"):
-                new_raw = pd.DataFrame([{ "client": nb_client, "address": nb_address, "service_date": "", "preferred_day": "", "flexible_days": nb_days, "time_window": nb_window, "earliest_start": DEFAULT_START, "latest_finish": DEFAULT_END, "job_hours": nb_hours, "cleaning_type": nb_type, "can_shift": "Yes", "frequency": "One time", "job_price": nb_price, "preferred_resource": "", "lock_resource": "No", "priority": nb_priority, "risk_level": "Medium" if nb_type == "Deep Cleaning" else "Low", "min_workers": 1, "max_workers": 2, "requires_team": "No" }])
-                new_booking = prepare_bookings(new_raw)
-                temp_instances = expand_recurring_bookings(new_booking, dates)
-                # Add its point to existing points and recompute small matrix for simplicity.
-                all_instances = pd.concat([booking_instances, temp_instances], ignore_index=True)
-                pts2, idx2, ptsdf2 = make_points(resources, all_instances, api_key, use_google)
-                m2, t2, _ = compute_route_matrix(pts2, api_key, use_google, routing_provider)
-                suggestions: List[Dict[str, Any]] = []
-                for _, row in temp_instances.iterrows():
-                    for d in candidate_dates_for_booking(row, dates):
-                        for _, res in resources.iterrows():
-                            ok, cand = evaluate_candidate(row, res.to_dict(), d, schedules_dict, member_events, exceptions, m2, t2, idx2, area_memory, hours_are_person_hours, mileage_cost, travel_hour_cost)
-                            if ok:
-                                suggestions.append(cand)
-                sug_df = pd.DataFrame(suggestions).sort_values("score").head(12) if suggestions else pd.DataFrame()
-                display_df("Best options for this new booking", sug_df[[c for c in ["date", "day", "resource", "resource_type", "members", "start", "end", "duration_hours", "travel_miles", "profit_score", "score", "score_notes"] if c in sug_df.columns]] if not sug_df.empty else sug_df)
-                if not sug_df.empty:
-                    best = sug_df.iloc[0]
-                    st.success(f"Best fit: {best['day']} with {best['resource']} around {best['start']}. Estimated drive before job: {best['travel_miles']} miles.")
-
-        with tab4:
-            display_df("Late-running / bad route / price alerts", alerts)
-            display_df("Price adjustment suggestions", price_suggestions)
-            display_df("Auto-message suggestions for moving clients", move_messages)
-            display_df("Emergency rescue mode suggestions", rescue)
-            st.info("Emergency mode is designed to protect VIP/high-priority clients first, then move flexible or low-priority jobs when someone calls off or a route becomes too tight.")
-
-        with tab5:
-            create_map(schedule, points_df)
-            with st.expander("Location/geocoding source"):
-                display_df("Points", points_df)
-
-        with tab6:
-            approved_texts = build_daily_text(approved_schedule)
-            if approved_texts.empty:
-                st.info("No approved cleaner messages yet. Approve rows in the Review + schedule tab first.")
-            else:
-                for _, r in approved_texts.iterrows():
-                    st.markdown(f"**{r['resource']} — {pd.to_datetime(r['date']).strftime('%A, %b %d')}**")
-                    st.code(r["message"], language="text")
-
-        with tab7:
-            sheets = {
-                "Approved Schedule": approved_schedule,
-                "Full Reviewed Schedule": reviewed_schedule,
-                "Rejected Review Rows": pd.concat([rejected_schedule, needs_review_schedule], ignore_index=True) if (not rejected_schedule.empty or not needs_review_schedule.empty) else pd.DataFrame(),
-                "Original Recommendation": schedule,
-                "Unassigned": unassigned,
-                "Alerts": alerts,
-                "Price Suggestions": price_suggestions,
-                "Move Messages": move_messages,
-                "Emergency Rescue": rescue,
-                "Actual Time Learning": time_learning,
-                "Actuals Uploaded": actuals,
-                "Cleaner Texts": approved_texts,
-                "Resources": resources.drop(columns=["member_keys"], errors="ignore"),
-                "Points": points_df,
-                "Active Bookings Source": bookings_raw,
-            }
-            excel = to_excel(sheets)
-            st.download_button("Download Excel report", data=excel, file_name="dynamic_duo_schedule_report_v7.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            if not approved_schedule.empty:
-                st.download_button("Download approved schedule CSV", data=approved_schedule.to_csv(index=False), file_name="approved_schedule_v7.csv", mime="text/csv")
-            if not reviewed_schedule.empty:
-                st.download_button("Download full reviewed schedule CSV", data=reviewed_schedule.to_csv(index=False), file_name="reviewed_schedule_v7.csv", mime="text/csv")
-
-            st.divider()
-            st.subheader("Save back to Google Sheets")
-            st.caption("This is optional. Use it to keep both admins aligned after review. BookingKoala remains the official calendar until you manually update it there.")
-            if use_google_sheets_master and google_sheets_configured(sheet_id)[0]:
-                col_save1, col_save2, col_save3 = st.columns(3)
-                with col_save1:
-                    if st.button("Save approved schedule to Sheet"):
-                        st.success(write_google_tab(sheet_id, MASTER_SHEET_TABS["approved"], approved_schedule))
-                with col_save2:
-                    if st.button("Save reviewed schedule to Sheet"):
-                        st.success(write_google_tab(sheet_id, MASTER_SHEET_TABS["reviewed"], reviewed_schedule))
-                with col_save3:
-                    if st.button("Save current alerts to Sheet"):
-                        st.success(write_google_tab(sheet_id, MASTER_SHEET_TABS["alerts"], alerts))
-            else:
-                st.info("Connect Google Sheets in the sidebar to enable save-back buttons.")
-
-        with tab8:
-            st.subheader("Download templates")
-            templates = {
-                "cleaners_template.csv": default_cleaners(),
-                "bookings_template.csv": default_bookings(),
-                "crew_rules_template.csv": default_crews(),
-                "availability_exceptions_template.csv": default_exceptions(),
-                "area_memory_template.csv": default_area_memory(),
-                "actual_time_history_template.csv": default_actuals(),
-                "bookingkoala_import_template.csv": default_bookings().rename(columns={"client": "customer_full_name", "address": "appointment_address", "service_date": "booking_start_date", "cleaning_type": "service_type", "job_price": "appointment_total"}),
-                "ghl_import_template.csv": default_bookings().rename(columns={"client": "full_name", "address": "service_address", "cleaning_type": "service_type", "job_price": "quoted_price"}),
-            }
-            template_path = "dynamic_duo_google_sheets_master_template.xlsx"
-            if os.path.exists(template_path):
-                with open(template_path, "rb") as fh:
-                    st.download_button(
-                        "dynamic_duo_google_sheets_master_template.xlsx",
-                        data=fh.read(),
-                        file_name="dynamic_duo_google_sheets_master_template.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
-            for fname, df in templates.items():
-                st.download_button(fname, data=df.to_csv(index=False), file_name=fname, mime="text/csv")
-            st.markdown("""
-            **Important setup notes for v7**
-            - Google Sheets can now be the shared source for `Cleaners`, `Crew Rules`, `Availability Exceptions`, `Area Memory`, `Actual Time History`, and `Active Bookings`.
-            - Weekly BookingKoala/GHL bookings can be uploaded once and saved as the shared `Active Bookings` tab.
-            - When the other admin opens the app with no bookings CSV uploaded, the app loads `Active Bookings` from Google Sheets.
-            - Uploaded CSVs override the Google Sheet for that specific optimization run until you click **Save uploaded CSV as Active Week**.
-            - Use `Approved Schedule`, `Reviewed Schedule`, and `Alerts` save-back buttons in the Export tab when both admins need to see the same result.
-            - `crew_rules.csv`: fixed and optional teams, like Isabel/Jacky or Billy/Eduardo.
-            - `area_memory.csv`: best days/resources for Lakeville, Eagan, New Prague, etc.
-            - `priority`: VIP, High, Normal, Low.
-            - `min_workers`, `max_workers`, `requires_team`: controls solo vs crew assignment.
-            - `risk_level` and `buffer_minutes`: protects the next job from late-running homes.
-            - `actual_time_history.csv`: compares estimated vs actual hours and learns extra buffer for future jobs.
-            - Manager review: approve, lock, reject, or mark schedule rows for manual review before exporting.
-            - Auto-message suggestions: copy/paste messages for moving flexible clients to better cluster days.
-            """)
-
-    except Exception as exc:
-        st.error(f"Could not optimize schedule: {exc}")
-        st.exception(exc)
-
-
-if __name__ == "__main__":
-    main()

@@ -1,36 +1,35 @@
-# Dynamic Duo Cleaning - Simple Schedule Planner v10
+# Dynamic Duo Cleaning Schedule Planner v11
 
-This version is simplified for daily use.
+Simplified Streamlit version focused on the real workflow:
 
-## Main workflow
+1. Upload BookingKoala/GHL weekly CSV
+2. Save as Active Week for both admins, if Google Sheets is connected
+3. Build day-by-day cleaner/team routes
+4. Review/approve schedule by day
+5. Use New Booking Checker before confirming new jobs
+6. Export approved schedule / cleaner texts
 
-1. Export weekly bookings from BookingKoala/GHL.
-2. Upload the CSV in the app.
-3. Optionally save it as the shared Active Week in Google Sheets so both admins can see it.
-4. Add temporary teams for the week if needed, such as Isabel/Jacky or Billy/Eduardo.
-5. Optionally force a cleaner/team or worker count for specific jobs.
-6. Review the schedule by day.
-7. Approve/lock/reject rows.
-8. Export the approved schedule and update BookingKoala manually.
+## Main files
 
-## What was simplified from v9
+- `app.py` — Streamlit app
+- `optimizer_core.py` — scheduling and Google Sheets/Maps helper logic
+- `requirements.txt` — packages for Streamlit Cloud
+- `dynamic_duo_google_sheets_master_template.xlsx` — Google Sheets master template
 
-- Removed the separate Alerts + Emergency tab.
-- Removed the Map tab from the main workflow.
-- Focused the interface on Weekly Schedule, New Booking Checker, Cleaners & Teams, and Export.
-- Added an easy temporary team builder so you can select multiple cleaners working together for a day/week.
-- Added an optional job-control table to force a cleaner/team, require a team, or keep a client locked.
-- Added day-by-day schedule cards showing each cleaner/team route, total jobs, work hours, and miles.
+## Streamlit entrypoint
 
-## Files
+Use:
 
-- `app.py` - simplified Streamlit interface.
-- `optimizer_core.py` - scheduling, Google Sheets, Google Maps, and optimization logic.
-- `requirements.txt` - Python requirements.
-- `dynamic_duo_google_sheets_master_template.xlsx` - shared Google Sheets template.
+```text
+app.py
+```
 
-## Deploy
+## Google routing note
 
-Use `app.py` as the main file on Streamlit Cloud.
+The app works without Google routing by using approximate fallback miles. To use real driving miles, create a Google Maps API key that can call:
 
-Keep API keys and service account JSON only in Streamlit Secrets, not GitHub.
+- Routes API
+- Geocoding API
+- Distance Matrix API (Legacy), optional backup
+
+While testing, keep Application restrictions as `None`; after it works, restrict the key safely.

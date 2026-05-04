@@ -1,20 +1,51 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
-from typing import Any, Dict, List
+from itertools import combinations
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 import streamlit as st
 
 import optimizer_core as core
 
-APP_TITLE = "Dynamic Duo Cleaning - Simple Schedule Planner v10"
+APP_TITLE = "Dynamic Duo Cleaning - Schedule Planner v11"
 
 
 def safe_cols(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
     return df[[c for c in cols if c in df.columns]].copy()
+
+
+def clean_money(x: Any) -> str:
+    try:
+        if pd.isna(x) or str(x) == "":
+            return "-"
+        return f"${float(x):,.0f}"
+    except Exception:
+        return str(x)
+
+
+def css() -> None:
+    st.markdown(
+        """
+        <style>
+        .dd-card {border:1px solid #e7e7e7;border-radius:18px;padding:14px 16px;margin:8px 0;background:#ffffff;box-shadow:0 1px 4px rgba(0,0,0,.04)}
+        .dd-day {border:1px solid #dedede;border-radius:20px;padding:14px;margin:6px 0;background:#fbfbfb;min-height:210px}
+        .dd-day-title {font-size:17px;font-weight:700;margin-bottom:4px}
+        .dd-meta {font-size:13px;color:#666;margin-bottom:8px}
+        .dd-route {border-left:5px solid #dedede;border-radius:12px;background:#fff;padding:10px 12px;margin:10px 0}
+        .dd-resource {font-weight:700;font-size:15px;margin-bottom:4px}
+        .dd-job {font-size:13px;line-height:1.35;margin:5px 0;padding-bottom:5px;border-bottom:1px dashed #eee}
+        .dd-pill {display:inline-block;border-radius:999px;padding:2px 8px;background:#f2f2f2;font-size:12px;margin:2px 4px 2px 0}
+        .dd-best {border:1px solid #d7eadb;background:#f6fff7;border-radius:18px;padding:14px;margin:8px 0}
+        .dd-warn {border:1px solid #ffe2a3;background:#fffaf0;border-radius:14px;padding:12px;margin:8px 0}
+        .block-container {padding-top: 2rem;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def normalize_bookings_for_editor(raw: pd.DataFrame) -> pd.DataFrame:
@@ -24,17 +55,9 @@ def normalize_bookings_for_editor(raw: pd.DataFrame) -> pd.DataFrame:
     df = df.reset_index(drop=True)
     df["booking_row_id"] = range(len(df))
     defaults: Dict[str, Any] = {
-        "client": "",
-        "address": "",
-        "preferred_resource": "",
-        "lock_resource": "No",
-        "min_workers": 1,
-        "max_workers": 2,
-        "requires_team": "No",
-        "priority": "Normal",
-        "job_hours": 2.5,
-        "job_price": "",
-        "time_window": "Flexible",
+        "client": "", "address": "", "preferred_resource": "", "lock_resource": "No",
+        "min_workers": 1, "max_workers": 4, "requires_team": "No", "priority": "Normal",
+        "job_hours": 2.5, "job_price": "", "time_window": "Flexible",
     }
     for col, val in defaults.items():
         if col not in df.columns:
@@ -61,19 +84,41 @@ def apply_booking_editor(raw: pd.DataFrame, edited: pd.DataFrame) -> pd.DataFram
     return base.reset_index(drop=True)
 
 
-def append_temporary_crews(crews_raw: pd.DataFrame) -> pd.DataFrame:
-    temp = st.session_state.get("temp_crews", [])
-    if not temp:
-        return crews_raw
-    temp_df = pd.DataFrame(temp)
-    if crews_raw is None or crews_raw.empty:
-        return temp_df
-    return pd.concat([crews_raw, temp_df], ignore_index=True)
+def build_pair_rows(cleaners_raw: pd.DataFrame, chosen_pair_labels: List[str], days: List[str]) -> pd.DataFrame:
+    if cleaners_raw is None or cleaners_raw.empty or not chosen_pair_labels:
+        return pd.DataFrame()
+    cleaners = core.prepare_cleaners(cleaners_raw)
+    by_name = {str(r["cleaner"]): r for _, r in cleaners.iterrows()}
+    rows = []
+    for label in chosen_pair_labels:
+        if " + " not in label:
+            continue
+        a, b = [x.strip() for x in label.split(" + ", 1)]
+        if a not in by_name or b not in by_name:
+            continue
+        hourly = float(by_name[a].get("hourly_cost", 25)) + float(by_name[b].get("hourly_cost", 25))
+        rows.append({
+            "resource_name": f"{a}/{b}",
+            "members": f"{a};{b}",
+            "team_type": "Optional",
+            "available_days": ",".join(days),
+            "base_address": str(by_name[a].get("base_address", "")),
+            "can_split_after_job": "Yes",
+            "always_together": "No",
+            "carpool": "Yes",
+            "max_jobs_per_day": 4,
+            "max_hours_per_day": 8,
+            "start_time": core.DEFAULT_START,
+            "end_time": core.DEFAULT_END,
+            "productivity_multiplier": 2,
+            "hourly_cost_override": hourly,
+        })
+    return pd.DataFrame(rows)
 
 
-def render_quick_team_builder(cleaners_raw: pd.DataFrame) -> None:
-    st.markdown("### 2) Teams for this week")
-    st.caption("Use this when multiple cleaners will ride/work together. The app will treat them as one route resource, and one-person hours will be divided by the team size/productivity.")
+def render_team_setup(cleaners_raw: pd.DataFrame, crews_raw: pd.DataFrame) -> pd.DataFrame:
+    st.subheader("Cleaner/team setup for this week")
+    st.caption("Use this only when cleaners will work together. The optimizer can still split them into solo jobs later if the team is optional.")
     try:
         cleaners_preview = core.prepare_cleaners(cleaners_raw)
         cleaner_names = list(cleaners_preview["cleaner"].astype(str))
@@ -81,56 +126,77 @@ def render_quick_team_builder(cleaners_raw: pd.DataFrame) -> None:
         cleaner_names = []
 
     with st.container(border=True):
-        c1, c2, c3, c4 = st.columns([1.3, 1.7, 1.3, 1.0])
+        c1, c2, c3 = st.columns([1.5, 2.0, 1.2])
         with c1:
-            team_name = st.text_input("Team name", value="")
+            team_name = st.text_input("Manual team name", placeholder="Example: Billy/Eduardo")
         with c2:
-            members = st.multiselect("Cleaners working together", cleaner_names)
+            members = st.multiselect("Cleaners together", cleaner_names, key="manual_team_members")
         with c3:
-            days = st.multiselect("Days", [d.title() for d in core.WEEKDAY_ORDER[:5]], default=[d.title() for d in core.WEEKDAY_ORDER[:5]])
-        with c4:
-            team_type = st.selectbox("Type", ["Fixed", "Optional"])
-        multiplier = st.slider("Speed factor", min_value=1.0, max_value=4.0, value=float(max(1, len(members))), step=0.25, help="Example: 2 cleaners usually complete a 4-hour one-person job in about 2 hours, so speed factor is 2.")
-        if st.button("Add team for this run", type="secondary", disabled=len(members) < 2):
+            team_type = st.selectbox("Team type", ["Optional", "Fixed"], help="Fixed = always together. Optional = can split later if needed.")
+        days = st.multiselect("Days this team can work", [d.title() for d in core.WEEKDAY_ORDER[:5]], default=[d.title() for d in core.WEEKDAY_ORDER[:5]], key="manual_team_days")
+        speed = st.slider("Team speed factor", 1.0, 4.0, value=float(max(1, len(members))), step=0.25, help="2 cleaners usually finish a 4-hour one-person job in about 2 hours.")
+        if st.button("Add this team for current run", disabled=len(members) < 2):
             final_name = team_name.strip() or "/".join(members)
-            row = {
-                "resource_name": final_name,
-                "members": ";".join(members),
-                "team_type": team_type,
-                "available_days": ",".join(days),
-                "base_address": "",
-                "can_split_after_job": "No" if team_type == "Fixed" else "Yes",
-                "always_together": "Yes" if team_type == "Fixed" else "No",
-                "carpool": "Yes",
-                "max_jobs_per_day": 4,
-                "max_hours_per_day": 8,
-                "start_time": core.DEFAULT_START,
-                "end_time": core.DEFAULT_END,
-                "productivity_multiplier": multiplier,
-                "hourly_cost_override": "",
-            }
-            st.session_state.setdefault("temp_crews", []).append(row)
-            st.success(f"Added team: {final_name}")
+            st.session_state.setdefault("temp_crews_v11", []).append({
+                "resource_name": final_name, "members": ";".join(members), "team_type": team_type,
+                "available_days": ",".join(days), "base_address": "", "can_split_after_job": "No" if team_type == "Fixed" else "Yes",
+                "always_together": "Yes" if team_type == "Fixed" else "No", "carpool": "Yes", "max_jobs_per_day": 4,
+                "max_hours_per_day": 8, "start_time": core.DEFAULT_START, "end_time": core.DEFAULT_END,
+                "productivity_multiplier": speed, "hourly_cost_override": "",
+            })
             st.rerun()
 
-        temp = st.session_state.get("temp_crews", [])
-        if temp:
-            st.write("Temporary teams added for this run:")
-            st.dataframe(pd.DataFrame(temp)[["resource_name", "members", "team_type", "available_days", "productivity_multiplier"]], use_container_width=True, hide_index=True)
-            if st.button("Clear temporary teams"):
-                st.session_state["temp_crews"] = []
-                st.rerun()
+    pair_rows = pd.DataFrame()
+    with st.expander("Optional: allow automatic temporary pairs for large jobs", expanded=False):
+        st.caption("This lets the app consider pairs for larger cleanings while still allowing those same cleaners to work solo at other times.")
+        all_pairs = [f"{a} + {b}" for a, b in combinations(cleaner_names, 2)]
+        common_default = [p for p in all_pairs if p in {"Billy + Eduardo", "Isabel + Jacky"}]
+        chosen_pairs = st.multiselect("Allowed temporary pairs", all_pairs, default=common_default[:3])
+        pair_days = st.multiselect("Pair days", [d.title() for d in core.WEEKDAY_ORDER[:5]], default=[d.title() for d in core.WEEKDAY_ORDER[:5]], key="pair_days")
+        pair_rows = build_pair_rows(cleaners_raw, chosen_pairs, pair_days)
+        if not pair_rows.empty:
+            st.dataframe(pair_rows[["resource_name", "members", "team_type", "available_days", "productivity_multiplier"]], use_container_width=True, hide_index=True)
+
+    pieces = []
+    if crews_raw is not None and not crews_raw.empty:
+        pieces.append(crews_raw)
+    if st.session_state.get("temp_crews_v11"):
+        pieces.append(pd.DataFrame(st.session_state["temp_crews_v11"]))
+    if not pair_rows.empty:
+        pieces.append(pair_rows)
+    if not pieces:
+        return crews_raw
+    combined = pd.concat(pieces, ignore_index=True)
+    with st.expander("Current teams available to the optimizer", expanded=False):
+        st.dataframe(safe_cols(combined, ["resource_name", "members", "team_type", "available_days", "productivity_multiplier", "always_together"]), use_container_width=True, hide_index=True)
+        if st.button("Clear manual temporary teams"):
+            st.session_state["temp_crews_v11"] = []
+            st.rerun()
+    return combined
 
 
-def render_assignment_controls(bookings_raw: pd.DataFrame, resource_names: List[str]) -> pd.DataFrame:
-    st.markdown("### 3) Optional job controls")
-    st.caption("Most of the time, leave this alone. Use it only when you want to force a cleaner/team, require 2 cleaners, or mark a high-priority client before optimization.")
+def apply_large_job_rules(bookings_raw: pd.DataFrame, threshold: float, mode: str) -> pd.DataFrame:
     if bookings_raw is None or bookings_raw.empty:
         return bookings_raw
+    out = normalize_bookings_for_editor(bookings_raw)
+    hrs = out["job_hours"].apply(lambda x: core.parse_float(x, 0.0))
+    big = hrs >= float(threshold)
+    if mode == "Let app choose solo or team for big jobs":
+        out.loc[big, "max_workers"] = out.loc[big, "max_workers"].apply(lambda x: max(int(core.parse_float(x, 1)), 4))
+        out.loc[big, "requires_team"] = out.loc[big, "requires_team"].replace("", "No")
+    elif mode == "Prefer/require team for big jobs":
+        out.loc[big, "min_workers"] = 2
+        out.loc[big, "max_workers"] = 4
+        out.loc[big, "requires_team"] = "Yes"
+    return out
+
+
+def render_job_controls(bookings_raw: pd.DataFrame, resource_names: List[str]) -> pd.DataFrame:
+    st.subheader("Optional job controls")
+    st.caption("Leave this alone unless you need to force a team, lock a priority client, or correct hours/price before optimizing.")
     norm = normalize_bookings_for_editor(bookings_raw)
-    cols = ["booking_row_id", "client", "address", "preferred_resource", "lock_resource", "min_workers", "max_workers", "requires_team", "priority", "job_hours", "job_price", "time_window"]
-    view = safe_cols(norm, cols)
-    with st.expander("Optional: force cleaner/team or worker count for specific jobs", expanded=False):
+    view = safe_cols(norm, ["booking_row_id", "client", "address", "preferred_resource", "lock_resource", "min_workers", "max_workers", "requires_team", "priority", "job_hours", "job_price", "time_window"])
+    with st.expander("Adjust specific jobs", expanded=False):
         edited = st.data_editor(
             view,
             use_container_width=True,
@@ -143,144 +209,149 @@ def render_assignment_controls(bookings_raw: pd.DataFrame, resource_names: List[
                 "priority": st.column_config.SelectboxColumn("Priority", options=["VIP", "High", "Normal", "Low"]),
                 "time_window": st.column_config.SelectboxColumn("Time window", options=["Flexible", "Morning", "Afternoon", "Fixed"]),
             },
-            key="simple_booking_controls",
+            key="job_controls_v11",
         )
-        st.caption("Example: create team Isabel/Jacky above, then choose Isabel/Jacky as preferred cleaner/team and set Lock = Yes for a specific job.")
-    return apply_booking_editor(bookings_raw, edited if "edited" in locals() else view)
+    return apply_booking_editor(bookings_raw, edited)
 
 
-def day_summary(schedule: pd.DataFrame, day_value: Any) -> pd.DataFrame:
-    df = schedule[schedule["date"].astype(str) == str(day_value)].copy()
-    if df.empty:
-        return df
-    return df.sort_values(["resource", "start_min"])
+def route_card_html(resource: str, r: pd.DataFrame) -> str:
+    miles = float(r["travel_miles"].astype(float).sum()) if "travel_miles" in r else 0.0
+    hours = float(r["duration_hours"].astype(float).sum()) if "duration_hours" in r else 0.0
+    members = str(r["members"].iloc[0]) if "members" in r.columns and not r.empty else ""
+    jobs_html = ""
+    for _, row in r.sort_values("start_min").iterrows():
+        jobs_html += (
+            f"<div class='dd-job'><b>{row.get('start','')}–{row.get('end','')}</b> · "
+            f"{row.get('client','')}<br><span style='color:#666'>{row.get('city','')} · {row.get('cleaning_type','')} · "
+            f"{row.get('duration_hours','')} hrs · {row.get('travel_miles','')} mi before</span></div>"
+        )
+    return (
+        f"<div class='dd-route'><div class='dd-resource'>{resource}</div>"
+        f"<div class='dd-meta'>{members if members and members != resource else ''}</div>"
+        f"<span class='dd-pill'>{len(r)} jobs</span><span class='dd-pill'>{miles:.1f} mi</span><span class='dd-pill'>{hours:.1f} work hrs</span>"
+        f"{jobs_html}</div>"
+    )
 
 
-def render_weekly_schedule(schedule: pd.DataFrame, unassigned: pd.DataFrame, alerts: pd.DataFrame, price_suggestions: pd.DataFrame, time_learning: pd.DataFrame) -> pd.DataFrame:
-    st.subheader("Weekly schedule by day")
-    if schedule.empty:
-        st.info("No jobs scheduled yet.")
-        return schedule
+def render_calendar_overview(schedule: pd.DataFrame, dates: List[date]) -> None:
+    st.subheader("Weekly schedule calendar")
+    st.caption("Each day shows cleaner/team routes, job order, travel miles, and work hours.")
+    if schedule is None or schedule.empty:
+        st.info("No scheduled jobs yet.")
+        return
+    dates_to_show = [d for d in dates if str(d) in set(schedule["date"].astype(str))]
+    if not dates_to_show:
+        dates_to_show = sorted([pd.to_datetime(str(x)).date() for x in schedule["date"].unique()])
+    for i in range(0, len(dates_to_show), 5):
+        row_dates = dates_to_show[i:i+5]
+        cols = st.columns(len(row_dates))
+        for col, d in zip(cols, row_dates):
+            day_df = schedule[schedule["date"].astype(str) == str(d)].copy()
+            label = pd.to_datetime(str(d)).strftime("%a, %b %d")
+            total_miles = float(day_df["travel_miles"].astype(float).sum()) if not day_df.empty and "travel_miles" in day_df else 0.0
+            with col:
+                html = f"<div class='dd-day'><div class='dd-day-title'>{label}</div><div class='dd-meta'>{len(day_df)} jobs · {day_df['resource'].nunique() if not day_df.empty else 0} routes · {total_miles:.1f} mi</div>"
+                for resource in day_df.sort_values(["resource", "start_min"])["resource"].dropna().astype(str).unique():
+                    r = day_df[day_df["resource"].astype(str) == resource]
+                    html += route_card_html(resource, r)
+                html += "</div>"
+                st.markdown(html, unsafe_allow_html=True)
 
-    dates = sorted(schedule["date"].unique(), key=lambda x: str(x))
+
+def render_approval_calendar(schedule: pd.DataFrame, dates: List[date]) -> pd.DataFrame:
+    st.subheader("Approve or adjust final schedule")
+    st.caption("Approve day by day. Use Lock when you are sure that route should not be changed.")
+    reviewed = core.add_manager_review_columns(schedule)
+    edited_parts = []
     for d in dates:
-        day_df = day_summary(schedule, d)
+        day_df = reviewed[reviewed["date"].astype(str) == str(d)].copy()
         if day_df.empty:
             continue
         day_label = pd.to_datetime(str(d)).strftime("%A, %b %d")
         total_miles = float(day_df["travel_miles"].astype(float).sum()) if "travel_miles" in day_df else 0.0
-        resources_used = int(day_df["resource"].nunique()) if "resource" in day_df else 0
-        jobs = len(day_df)
-        with st.expander(f"{day_label} — {jobs} jobs | {resources_used} cleaner/team routes | {total_miles:.1f} drive miles before jobs", expanded=True):
-            resource_names = list(day_df["resource"].dropna().astype(str).unique())
-            for resource in resource_names:
-                r = day_df[day_df["resource"].astype(str) == resource].copy().sort_values("start_min")
-                miles = float(r["travel_miles"].astype(float).sum()) if "travel_miles" in r else 0.0
-                hours = float(r["duration_hours"].astype(float).sum()) if "duration_hours" in r else 0.0
-                members = str(r["members"].iloc[0]) if "members" in r.columns and not r.empty else ""
-                with st.container(border=True):
-                    st.markdown(f"**{resource}** {f'({members})' if members and members != resource else ''}")
-                    m1, m2, m3 = st.columns(3)
-                    m1.metric("Jobs", len(r))
-                    m2.metric("Drive miles", f"{miles:.1f}")
-                    m3.metric("Work hours", f"{hours:.1f}")
-                    cols = ["start", "end", "client", "city", "cleaning_type", "duration_hours", "travel_miles", "profit_score", "score_notes"]
-                    st.dataframe(safe_cols(r, cols), use_container_width=True, hide_index=True)
-
-    st.divider()
-    st.subheader("Approve or adjust final schedule")
-    reviewed = core.add_manager_review_columns(schedule)
-    display_cols = ["manager_status", "lock_assignment", "manager_note", "date", "day", "resource", "start", "end", "client", "city", "duration_hours", "travel_miles", "profit_score", "instance_id"]
-    review_cols = [c for c in display_cols if c in reviewed.columns]
-    edited_review = st.data_editor(
-        reviewed[review_cols],
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "manager_status": st.column_config.SelectboxColumn("Status", options=["Approve", "Lock", "Needs Review", "Reject"], required=True),
-            "lock_assignment": st.column_config.CheckboxColumn("Lock"),
-            "manager_note": st.column_config.TextColumn("Manager note"),
-        },
-        disabled=[c for c in review_cols if c not in {"manager_status", "lock_assignment", "manager_note"}],
-        key="simple_manager_review_editor",
-    )
-    reviewed_schedule = core.apply_review_status_to_schedule(schedule, edited_review)
+        with st.expander(f"{day_label} — approve {len(day_df)} jobs · {total_miles:.1f} miles", expanded=False):
+            display_cols = ["manager_status", "lock_assignment", "manager_note", "resource", "start", "end", "client", "city", "duration_hours", "travel_miles", "profit_score", "instance_id"]
+            cols = [c for c in display_cols if c in day_df.columns]
+            edited = st.data_editor(
+                day_df[cols],
+                use_container_width=True,
+                hide_index=True,
+                disabled=[c for c in cols if c not in {"manager_status", "lock_assignment", "manager_note"}],
+                column_config={
+                    "manager_status": st.column_config.SelectboxColumn("Status", options=["Approve", "Lock", "Needs Review", "Reject"], required=True),
+                    "lock_assignment": st.column_config.CheckboxColumn("Lock"),
+                    "manager_note": st.column_config.TextColumn("Manager note"),
+                },
+                key=f"review_day_{str(d)}",
+            )
+            edited_parts.append(edited)
+    if edited_parts:
+        edited_all = pd.concat(edited_parts, ignore_index=True)
+        reviewed_schedule = core.apply_review_status_to_schedule(schedule, edited_all)
+    else:
+        reviewed_schedule = reviewed
     approved, rejected, needs_review = core.split_reviewed_schedule(reviewed_schedule)
     c1, c2, c3 = st.columns(3)
     c1.metric("Approved/locked", len(approved))
     c2.metric("Needs review", len(needs_review))
     c3.metric("Rejected", len(rejected))
-
-    with st.expander("Show problem jobs and learning notes", expanded=False):
-        core.display_df("Unassigned jobs", unassigned)
-        core.display_df("High-value warnings", safe_cols(alerts, ["date", "resource", "client", "alert", "detail", "severity"]))
-        core.display_df("Price / route suggestions", safe_cols(price_suggestions, ["client", "resource", "date", "suggestion", "reason", "profit_score", "travel_miles"]))
-        core.display_df("Actual time learning applied", time_learning)
     return reviewed_schedule
 
 
-def render_new_booking_checker(resources: pd.DataFrame, dates: List[date], schedule: pd.DataFrame, booking_instances: pd.DataFrame, schedules_dict: Dict, member_events: Dict, exceptions: pd.DataFrame, area_memory: pd.DataFrame, points: List[Dict[str, Any]], point_idx: Dict[str, int], api_key: str, use_google: bool, routing_provider: str, hours_are_person_hours: bool, mileage_cost: float, travel_hour_cost: float) -> None:
-    st.subheader("New booking checker")
-    st.caption("Use this before confirming a new client. It tells you which day and cleaner/team fits best with the existing week.")
-    with st.container(border=True):
-        r1c1, r1c2, r1c3 = st.columns([1.4, 1.8, 1.0])
-        with r1c1:
-            nb_client = st.text_input("Client name", value="New Lead")
-        with r1c2:
-            nb_address = st.text_input("Address/city", value="Lakeville, MN")
-        with r1c3:
-            nb_price = st.number_input("Quoted price", value=240.0, min_value=0.0, step=10.0)
-        r2c1, r2c2, r2c3, r2c4 = st.columns(4)
-        with r2c1:
-            nb_type = st.selectbox("Cleaning type", ["Standard", "Deep Cleaning", "Move Out", "Airbnb"])
-        with r2c2:
-            nb_hours = st.number_input("One-person job hours", value=3.0, min_value=0.5, step=0.5)
-        with r2c3:
-            nb_days = st.text_input("Possible days", value="Tuesday,Wednesday,Thursday")
-        with r2c4:
-            nb_window = st.selectbox("Time window", ["Flexible", "Morning", "Afternoon", "Fixed"])
-        r3c1, r3c2, r3c3 = st.columns(3)
-        with r3c1:
-            nb_priority = st.selectbox("Priority", ["VIP", "High", "Normal", "Low"], index=2)
-        with r3c2:
-            workers_choice = st.selectbox("Cleaner setup", ["Can be solo or team", "Must be 2+ cleaners", "Solo only"])
-        with r3c3:
-            max_options = min(8, len(resources)) if len(resources) else 1
-            result_count = st.slider("Options to show", 3, max(3, max_options), min(5, max(3, max_options)))
+def render_problem_summary(unassigned: pd.DataFrame, alerts: pd.DataFrame, price_suggestions: pd.DataFrame, time_learning: pd.DataFrame) -> None:
+    issues = len(unassigned) + len(price_suggestions)
+    if issues == 0 and (alerts is None or alerts.empty):
+        st.success("No major scheduling problems found.")
+        return
+    with st.expander("Problem jobs / price warnings", expanded=False):
+        core.display_df("Unassigned jobs", unassigned)
+        core.display_df("Route warnings", safe_cols(alerts, ["date", "resource", "client", "alert", "detail", "severity"]))
+        core.display_df("Price suggestions", safe_cols(price_suggestions, ["client", "resource", "date", "suggestion", "reason", "profit_score", "travel_miles"]))
+        core.display_df("Actual time learning applied", time_learning)
 
-    if st.button("Find best day + cleaner/team", type="primary"):
-        if workers_choice == "Must be 2+ cleaners":
+
+def render_new_booking_checker(resources: pd.DataFrame, dates: List[date], schedule: pd.DataFrame, booking_instances: pd.DataFrame, schedules_dict: Dict, member_events: Dict, exceptions: pd.DataFrame, area_memory: pd.DataFrame, api_key: str, use_google: bool, routing_provider: str, hours_are_person_hours: bool, mileage_cost: float, travel_hour_cost: float) -> None:
+    st.subheader("New booking checker")
+    st.caption("Use this before confirming a new client. It checks where the new job fits with the current weekly routes.")
+    with st.container(border=True):
+        c1, c2, c3, c4 = st.columns([1.2, 2.0, 1.0, 1.0])
+        with c1:
+            nb_client = st.text_input("Client", value="New Lead")
+        with c2:
+            nb_address = st.text_input("Address / city", value="Lakeville, MN")
+        with c3:
+            nb_hours = st.number_input("One-person hours", value=3.0, min_value=0.5, step=0.5)
+        with c4:
+            nb_price = st.number_input("Quoted price", value=240.0, min_value=0.0, step=10.0)
+        c5, c6, c7, c8 = st.columns(4)
+        with c5:
+            nb_type = st.selectbox("Type", ["Standard", "Deep Cleaning", "Move Out", "Airbnb"])
+        with c6:
+            nb_days = st.text_input("Possible days", value="Tuesday,Wednesday,Thursday")
+        with c7:
+            nb_window = st.selectbox("Time window", ["Flexible", "Morning", "Afternoon", "Fixed"])
+        with c8:
+            worker_pref = st.selectbox("Cleaner setup", ["App chooses solo/team", "Must be team", "Solo only"])
+    if st.button("Find best fit", type="primary"):
+        if worker_pref == "Must be team":
             min_workers, max_workers, requires_team = 2, 4, "Yes"
-        elif workers_choice == "Solo only":
+        elif worker_pref == "Solo only":
             min_workers, max_workers, requires_team = 1, 1, "No"
         else:
             min_workers, max_workers, requires_team = 1, 4, "No"
         new_raw = pd.DataFrame([{ 
-            "client": nb_client,
-            "address": nb_address,
-            "service_date": "",
-            "preferred_day": "",
-            "flexible_days": nb_days,
-            "time_window": nb_window,
-            "earliest_start": core.DEFAULT_START,
-            "latest_finish": core.DEFAULT_END,
-            "job_hours": nb_hours,
-            "cleaning_type": nb_type,
-            "can_shift": "Yes",
-            "frequency": "One time",
-            "job_price": nb_price,
-            "preferred_resource": "",
-            "lock_resource": "No",
-            "priority": nb_priority,
+            "client": nb_client, "address": nb_address, "service_date": "", "preferred_day": "",
+            "flexible_days": nb_days, "time_window": nb_window, "earliest_start": core.DEFAULT_START,
+            "latest_finish": core.DEFAULT_END, "job_hours": nb_hours, "cleaning_type": nb_type,
+            "can_shift": "Yes", "frequency": "One time", "job_price": nb_price,
+            "preferred_resource": "", "lock_resource": "No", "priority": "Normal",
             "risk_level": "Medium" if nb_type == "Deep Cleaning" else "Low",
-            "min_workers": min_workers,
-            "max_workers": max_workers,
-            "requires_team": requires_team,
+            "min_workers": min_workers, "max_workers": max_workers, "requires_team": requires_team,
         }])
         new_booking = core.prepare_bookings(new_raw)
         temp_instances = core.expand_recurring_bookings(new_booking, dates)
         all_instances = pd.concat([booking_instances, temp_instances], ignore_index=True)
-        pts2, idx2, _ptsdf2 = core.make_points(resources, all_instances, api_key, use_google)
+        pts2, idx2, _ = core.make_points(resources, all_instances, api_key, use_google)
         m2, t2, _ = core.compute_route_matrix(pts2, api_key, use_google, routing_provider)
         suggestions: List[Dict[str, Any]] = []
         for _, row in temp_instances.iterrows():
@@ -289,29 +360,41 @@ def render_new_booking_checker(resources: pd.DataFrame, dates: List[date], sched
                     ok, cand = core.evaluate_candidate(row, res.to_dict(), d, schedules_dict, member_events, exceptions, m2, t2, idx2, area_memory, hours_are_person_hours, mileage_cost, travel_hour_cost)
                     if ok:
                         suggestions.append(cand)
-        sug_df = pd.DataFrame(suggestions).sort_values("score").head(result_count) if suggestions else pd.DataFrame()
+        sug_df = pd.DataFrame(suggestions).sort_values("score").head(6) if suggestions else pd.DataFrame()
         if sug_df.empty:
-            st.error("No clean fit found. Try more flexible days, a wider time window, or assign a team.")
-        else:
-            best = sug_df.iloc[0]
-            st.success(f"Best fit: {best['day']} with {best['resource']} around {best['start']}. Adds about {best['travel_miles']} drive miles before the job.")
-            show_cols = ["date", "day", "resource", "resource_type", "members", "start", "end", "duration_hours", "travel_miles", "profit_score", "score_notes"]
-            st.dataframe(safe_cols(sug_df, show_cols), use_container_width=True, hide_index=True)
-            st.markdown("**Client message option**")
-            msg = f"Hi {nb_client if nb_client != 'New Lead' else ''}, we have availability {best['day']} around {best['start']} and already have a cleaner/team in your area that day. Would that work for your cleaning?".replace("Hi ,", "Hi,")
-            st.code(msg, language="text")
+            st.error("No clean fit found. Try more flexible days, a wider time window, or allow a team.")
+            return
+        st.markdown("### Best options")
+        cols = st.columns(min(3, len(sug_df)))
+        for i, (_, opt) in enumerate(sug_df.head(3).iterrows()):
+            with cols[i % len(cols)]:
+                st.markdown(
+                    f"""
+                    <div class='dd-best'>
+                    <div class='dd-day-title'>#{i+1}: {opt['day']} · {opt['resource']}</div>
+                    <div class='dd-meta'>{opt['start']}–{opt['end']} · {opt.get('city','')}</div>
+                    <span class='dd-pill'>{opt['travel_miles']} mi before job</span>
+                    <span class='dd-pill'>{opt['duration_hours']} work hrs</span>
+                    <span class='dd-pill'>Profit {clean_money(opt.get('profit_score',''))}</span>
+                    <div style='font-size:13px;margin-top:8px;color:#555'>{opt.get('score_notes','')}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+        st.dataframe(safe_cols(sug_df, ["date", "day", "resource", "members", "start", "end", "duration_hours", "travel_miles", "profit_score", "score_notes"]), use_container_width=True, hide_index=True)
+        best = sug_df.iloc[0]
+        msg = f"Hi {nb_client if nb_client != 'New Lead' else ''}, we have availability {best['day']} around {best['start']} and already have a cleaner/team nearby that day. Would that work for your cleaning?".replace("Hi ,", "Hi,")
+        st.text_area("Copy/paste client message", msg, height=90)
 
 
-def render_export_tab(approved_schedule: pd.DataFrame, reviewed_schedule: pd.DataFrame, schedule: pd.DataFrame, unassigned: pd.DataFrame, alerts: pd.DataFrame, price_suggestions: pd.DataFrame, move_messages: pd.DataFrame, time_learning: pd.DataFrame, actuals: pd.DataFrame, resources: pd.DataFrame, points_df: pd.DataFrame, bookings_raw: pd.DataFrame, sheet_id: str, use_google_sheets_master: bool) -> None:
-    st.subheader("Export + cleaner texts")
+def render_export(approved_schedule: pd.DataFrame, reviewed_schedule: pd.DataFrame, schedule: pd.DataFrame, unassigned: pd.DataFrame, alerts: pd.DataFrame, price_suggestions: pd.DataFrame, move_messages: pd.DataFrame, time_learning: pd.DataFrame, actuals: pd.DataFrame, resources: pd.DataFrame, points_df: pd.DataFrame, bookings_raw: pd.DataFrame, sheet_id: str, use_google_sheets_master: bool) -> None:
+    st.subheader("Export + cleaner messages")
     approved_texts = core.build_daily_text(approved_schedule)
-    if approved_texts.empty:
-        st.info("Approve rows in the Weekly schedule tab to create cleaner text messages.")
-    else:
-        for _, r in approved_texts.iterrows():
-            st.markdown(f"**{r['resource']} — {pd.to_datetime(r['date']).strftime('%A, %b %d')}**")
-            st.code(r["message"], language="text")
-
+    if not approved_texts.empty:
+        with st.expander("Cleaner daily text messages", expanded=True):
+            for _, r in approved_texts.iterrows():
+                st.markdown(f"**{r['resource']} — {pd.to_datetime(r['date']).strftime('%A, %b %d')}**")
+                st.code(r["message"], language="text")
     sheets = {
         "Approved Schedule": approved_schedule,
         "Full Reviewed Schedule": reviewed_schedule,
@@ -328,44 +411,34 @@ def render_export_tab(approved_schedule: pd.DataFrame, reviewed_schedule: pd.Dat
         "Active Bookings Source": bookings_raw,
     }
     excel = core.to_excel(sheets)
-    st.download_button("Download full Excel report", data=excel, file_name="dynamic_duo_simple_schedule_report_v10.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button("Download Excel report", data=excel, file_name="dynamic_duo_schedule_report_v11.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     if not approved_schedule.empty:
-        st.download_button("Download approved schedule CSV", data=approved_schedule.to_csv(index=False), file_name="approved_schedule_v10.csv", mime="text/csv")
-
-    st.divider()
-    st.subheader("Save approved result for both admins")
+        st.download_button("Download approved schedule CSV", data=approved_schedule.to_csv(index=False), file_name="approved_schedule_v11.csv", mime="text/csv")
     if use_google_sheets_master and core.google_sheets_configured(sheet_id)[0]:
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("Save approved schedule to Google Sheet"):
+            if st.button("Save approved schedule to shared Sheet"):
                 st.success(core.write_google_tab(sheet_id, core.MASTER_SHEET_TABS["approved"], approved_schedule))
         with c2:
-            if st.button("Save reviewed schedule to Google Sheet"):
+            if st.button("Save reviewed schedule to shared Sheet"):
                 st.success(core.write_google_tab(sheet_id, core.MASTER_SHEET_TABS["reviewed"], reviewed_schedule))
-    else:
-        st.info("Connect Google Sheets if you want both admins to see the approved result inside the shared Sheet.")
 
 
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
-    st.title(APP_TITLE)
-    st.caption("Simplified workflow: upload BookingKoala CSV → build cleaner/team routes → review by day → export/update BookingKoala.")
+    css()
+    st.title("Dynamic Duo Schedule Planner")
+    st.caption("Simple workflow: upload BookingKoala CSV → create cleaner/team routes → review by day → export/update BookingKoala.")
 
     with st.sidebar:
-        st.header("Basic setup")
-        api_key_default = core.get_secret_value("GOOGLE_MAPS_API_KEY")
-        api_key = st.text_input("Google Maps API key", value=api_key_default, type="password")
-        use_google = st.checkbox("Use Google driving routes", value=bool(api_key_default))
-        routing_provider = st.selectbox("Routing provider", ["Auto", "Routes API", "Distance Matrix API (Legacy)", "Approximate only"], index=0)
-        if routing_provider == "Approximate only":
-            use_google = False
+        st.header("Setup")
         week_start = st.date_input("Week start", value=date.today())
         horizon_weeks = st.slider("Planning horizon", 1, 4, 2)
         include_weekends = st.checkbox("Include weekends", value=False)
         hours_are_person_hours = st.checkbox("Job hours are one-person hours", value=True)
 
         st.divider()
-        st.header("Shared admin setup")
+        st.header("Shared data")
         sheet_id_default = core.get_google_sheet_id()
         sheet_id = st.text_input("Google Sheet ID", value=sheet_id_default, type="password")
         sheets_ok, sheets_msg = core.google_sheets_configured(sheet_id)
@@ -373,46 +446,51 @@ def main() -> None:
         if use_google_sheets_master:
             st.success("Google Sheet ready") if sheets_ok else st.warning(sheets_msg)
 
-        with st.expander("Advanced costs/warnings"):
+        with st.expander("Google routing", expanded=False):
+            api_key_default = core.get_secret_value("GOOGLE_MAPS_API_KEY")
+            api_key = st.text_input("Google Maps API key", value=api_key_default, type="password")
+            use_google = st.checkbox("Use Google driving routes", value=False, help="Leave off until API key restrictions are fixed. The app still works with approximate miles.")
+            routing_provider = st.selectbox("Provider", ["Approximate only", "Auto", "Routes API", "Distance Matrix API (Legacy)"], index=0)
+            if routing_provider == "Approximate only":
+                use_google = False
+            st.caption("If Google says API_KEY_SERVICE_BLOCKED or REQUEST_DENIED, create/fix a server-side Google Maps key that allows Routes API and/or Distance Matrix API.")
+
+        with st.expander("Costs / warnings", expanded=False):
             mileage_cost = st.number_input("Mileage cost per mile", value=0.67, min_value=0.0, step=0.05)
             travel_hour_cost = st.number_input("Travel time cost per hour", value=15.0, min_value=0.0, step=1.0)
             min_profit = st.number_input("Minimum target profit per job", value=70.0, min_value=0.0, step=10.0)
             long_drive_miles = st.number_input("Bad route if drive leg exceeds miles", value=22.0, min_value=1.0, step=1.0)
 
-    st.markdown("### 1) Upload weekly bookings")
-    top1, top2 = st.columns([1.25, 1])
-    with top1:
+    st.markdown("### Upload weekly schedule")
+    u1, u2, u3 = st.columns([1.4, 1.1, 1.0])
+    with u1:
         bookings_file = st.file_uploader("BookingKoala/GHL bookings CSV", type=["csv"], key="bookings")
-        st.caption("This is the main file you export every week from BookingKoala/GHL.")
-    with top2:
+        st.caption("Upload once, then save as Active Week so both admins can use the same data.")
+    with u2:
         uploaded_by = st.text_input("Admin name / initials", value="Admin")
         st.caption(f"Planning window: {week_start.isoformat()} → {(week_start + timedelta(days=(7 * int(horizon_weeks)) - 1)).isoformat()}")
+    with u3:
         if bookings_file is not None:
-            uploaded_bookings_preview = core.read_uploaded_csv(bookings_file)
-            st.success(f"Uploaded {len(uploaded_bookings_preview)} booking row(s) for this run.")
+            uploaded_preview = core.read_uploaded_csv(bookings_file)
+            st.success(f"Uploaded {len(uploaded_preview)} booking row(s).")
             if use_google_sheets_master and sheets_ok:
-                if st.button("Save this CSV as Active Week for both admins", type="primary"):
-                    active_bookings = core.stamp_active_bookings(uploaded_bookings_preview, week_start, horizon_weeks, include_weekends, uploaded_by)
+                if st.button("Save as Active Week", type="primary"):
+                    active_bookings = core.stamp_active_bookings(uploaded_preview, week_start, horizon_weeks, include_weekends, uploaded_by)
                     meta = core.make_active_week_metadata(week_start, horizon_weeks, include_weekends, uploaded_by, len(active_bookings))
                     st.success(core.write_google_tab(sheet_id, core.MASTER_SHEET_TABS["bookings"], active_bookings))
                     st.success(core.write_google_tab(sheet_id, core.MASTER_SHEET_TABS["active_meta"], meta))
         elif use_google_sheets_master and sheets_ok:
-            st.info("No CSV uploaded. The app will load the shared Active Week from Google Sheets.")
+            st.info("No upload. Loading Active Week from Google Sheet.")
         else:
-            st.warning("Upload a bookings CSV or connect Google Sheets Active Week.")
+            st.warning("Upload bookings or connect Active Week.")
 
     with st.expander("Advanced CSV overrides", expanded=False):
         c1, c2, c3, c4, c5 = st.columns(5)
-        with c1:
-            cleaners_file = st.file_uploader("Cleaners CSV", type=["csv"], key="cleaners")
-        with c2:
-            crew_file = st.file_uploader("Crew rules CSV", type=["csv"], key="crews")
-        with c3:
-            exceptions_file = st.file_uploader("Day off CSV", type=["csv"], key="exceptions")
-        with c4:
-            area_file = st.file_uploader("Area memory CSV", type=["csv"], key="area")
-        with c5:
-            actuals_file = st.file_uploader("Actual time CSV", type=["csv"], key="actuals")
+        cleaners_file = c1.file_uploader("Cleaners CSV", type=["csv"], key="cleaners")
+        crew_file = c2.file_uploader("Crew rules CSV", type=["csv"], key="crews")
+        exceptions_file = c3.file_uploader("Day off CSV", type=["csv"], key="exceptions")
+        area_file = c4.file_uploader("Area memory CSV", type=["csv"], key="area")
+        actuals_file = c5.file_uploader("Actual time CSV", type=["csv"], key="actuals")
 
     try:
         files = {"cleaners": cleaners_file, "bookings": bookings_file, "crews": crew_file, "exceptions": exceptions_file, "area": area_file, "actuals": actuals_file}
@@ -429,17 +507,35 @@ def main() -> None:
                 st.write("- " + status)
 
         if bookings_raw is None or bookings_raw.empty:
-            st.warning("No bookings found. Upload a BookingKoala/GHL CSV or save/load Active Week from Google Sheets.")
+            st.warning("No bookings found. Upload a BookingKoala/GHL CSV or load Active Week from Google Sheets.")
             return
 
-        render_quick_team_builder(cleaners_raw)
-        crews_raw = append_temporary_crews(crews_raw)
+        tab_schedule, tab_new_booking, tab_teams, tab_export = st.tabs(["Weekly Planner", "New Booking Checker", "Cleaners & Teams", "Export"])
 
-        cleaners = core.prepare_cleaners(cleaners_raw)
-        crews = core.prepare_crew_rules(crews_raw)
-        resources, resource_lookup = core.build_resources(cleaners, crews)
-        resource_names = list(resources["resource"].astype(str)) if not resources.empty else []
-        bookings_raw = render_assignment_controls(bookings_raw, resource_names)
+        with tab_teams:
+            crews_raw = render_team_setup(cleaners_raw, crews_raw)
+            st.divider()
+            st.subheader("Large job team behavior")
+            colA, colB = st.columns([1.4, 1.0])
+            with colA:
+                large_job_mode = st.selectbox("For large jobs", ["Let app choose solo or team for big jobs", "Prefer/require team for big jobs", "No automatic rule"])
+            with colB:
+                large_job_threshold = st.number_input("Large job threshold: one-person hours", value=3.5, min_value=1.0, step=0.5)
+            if large_job_mode != "No automatic rule":
+                bookings_raw = apply_large_job_rules(bookings_raw, large_job_threshold, large_job_mode)
+            cleaners = core.prepare_cleaners(cleaners_raw)
+            crews = core.prepare_crew_rules(crews_raw)
+            resources, resource_lookup = core.build_resources(cleaners, crews)
+            resource_names = list(resources["resource"].astype(str)) if not resources.empty else []
+            bookings_raw = render_job_controls(bookings_raw, resource_names)
+            core.display_df("Cleaner/team resources", resources.drop(columns=["member_keys"], errors="ignore"))
+        # If user has not opened Cleaners & Teams first, still apply default team setup and resources.
+        if "crews" not in locals():
+            crews_raw = render_team_setup(cleaners_raw, crews_raw) if False else crews_raw
+            cleaners = core.prepare_cleaners(cleaners_raw)
+            crews = core.prepare_crew_rules(crews_raw)
+            resources, resource_lookup = core.build_resources(cleaners, crews)
+            bookings_raw = apply_large_job_rules(bookings_raw, 3.5, "Let app choose solo or team for big jobs")
 
         bookings = core.prepare_bookings(bookings_raw)
         actuals = core.prepare_actuals(actuals_raw)
@@ -448,14 +544,13 @@ def main() -> None:
         area_memory = core.prepare_area_memory(area_raw)
         dates = core.week_dates(week_start, horizon_weeks, include_weekends)
         booking_instances = core.expand_recurring_bookings(bookings, dates)
-
         if booking_instances.empty:
             st.warning("No bookings found inside this planning horizon.")
             return
 
-        with st.spinner("Optimizing routes by cleaner/team and location..."):
-            points, point_idx, points_df = core.make_points(resources, booking_instances, api_key, use_google)
-            miles_matrix, minutes_matrix, route_source = core.compute_route_matrix(points, api_key, use_google, routing_provider)
+        with st.spinner("Creating day-by-day cleaner/team routes..."):
+            points, point_idx, points_df = core.make_points(resources, booking_instances, api_key if 'api_key' in locals() else '', use_google if 'use_google' in locals() else False)
+            miles_matrix, minutes_matrix, route_source = core.compute_route_matrix(points, api_key if 'api_key' in locals() else '', use_google if 'use_google' in locals() else False, routing_provider if 'routing_provider' in locals() else "Approximate only")
             schedule, unassigned, alerts, schedules_dict, member_events = core.optimize_schedule(
                 booking_instances, resources, dates, exceptions, miles_matrix, minutes_matrix, point_idx,
                 area_memory, hours_are_person_hours, mileage_cost, travel_hour_cost,
@@ -463,42 +558,39 @@ def main() -> None:
             price_suggestions = core.price_adjustment_suggestions(schedule, min_profit, long_drive_miles)
             move_messages = core.build_move_message_suggestions(schedule, price_suggestions)
 
-        if "fallback" in str(route_source).lower() or "approx" in str(route_source).lower():
-            st.warning(f"Routing source: {route_source}. The schedule still works, but miles are approximate until Google routing is fixed.")
-        else:
-            st.success(f"Optimization completed using {route_source}.")
-
         total_miles = float(schedule["travel_miles"].astype(float).sum()) if not schedule.empty and "travel_miles" in schedule else 0.0
         used_resources = int(schedule["resource"].nunique()) if not schedule.empty and "resource" in schedule else 0
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Scheduled jobs", len(schedule))
         m2.metric("Unassigned", len(unassigned))
         m3.metric("Cleaner/team routes", used_resources)
-        m4.metric("Drive miles before jobs", f"{total_miles:.1f}")
+        m4.metric("Drive miles", f"{total_miles:.1f}")
 
-        tab1, tab2, tab3, tab4 = st.tabs(["Weekly schedule", "New booking checker", "Cleaners & teams", "Export"])
+        if "approx" in str(route_source).lower():
+            st.markdown(f"<div class='dd-warn'><b>Routing source:</b> {route_source}. Schedule works, but miles are approximate.</div>", unsafe_allow_html=True)
+            with st.expander("Google routing fix details", expanded=False):
+                err = st.session_state.get("last_google_routing_error", "")
+                if err:
+                    st.code(err[:2000], language="text")
+                st.write("The error usually means this API key is not allowed to call Routes API or Distance Matrix API. While testing, use a separate server-side key with Application restrictions set to None and API restrictions allowing Routes API, Geocoding API, and Distance Matrix API.")
+        else:
+            st.success(f"Optimization completed using {route_source}.")
 
-        with tab1:
-            reviewed_schedule = render_weekly_schedule(schedule, unassigned, alerts, price_suggestions, time_learning)
+        with tab_schedule:
+            render_calendar_overview(schedule, dates)
+            render_problem_summary(unassigned, alerts, price_suggestions, time_learning)
+            reviewed_schedule = render_approval_calendar(schedule, dates)
+            st.session_state["reviewed_schedule_v11"] = reviewed_schedule
             approved_schedule, rejected_schedule, needs_review_schedule = core.split_reviewed_schedule(reviewed_schedule)
+            st.session_state["approved_schedule_v11"] = approved_schedule
 
-        with tab2:
-            render_new_booking_checker(resources, dates, schedule, booking_instances, schedules_dict, member_events, exceptions, area_memory, points, point_idx, api_key, use_google, routing_provider, hours_are_person_hours, mileage_cost, travel_hour_cost)
+        with tab_new_booking:
+            render_new_booking_checker(resources, dates, schedule, booking_instances, schedules_dict, member_events, exceptions, area_memory, api_key if 'api_key' in locals() else '', use_google if 'use_google' in locals() else False, routing_provider if 'routing_provider' in locals() else "Approximate only", hours_are_person_hours, mileage_cost, travel_hour_cost)
 
-        with tab3:
-            st.subheader("Cleaners & teams being used by the optimizer")
-            st.caption("These are the solo cleaners and crew resources the app can assign. Update permanent cleaners/crews in Google Sheets; use the team builder above for temporary weekly teams.")
-            core.display_df("Available cleaner/team resources", resources.drop(columns=["member_keys"], errors="ignore"))
-            core.display_df("Cleaner master list", cleaners.drop(columns=["cleaner_key", "available_day_list", "allow_solo_bool"], errors="ignore"))
-            core.display_df("Crew rules", crews.drop(columns=["resource_key", "member_keys", "member_list", "available_day_list", "can_split_bool", "always_together_bool", "carpool_bool"], errors="ignore"))
-
-        with tab4:
-            # Re-read review state from session by rerendering helper? The Weekly tab sets local variables only when opened.
-            # If tab4 is opened first, default all approved.
-            if "reviewed_schedule" not in locals() or reviewed_schedule is None or reviewed_schedule.empty:
-                reviewed_schedule = core.add_manager_review_columns(schedule)
+        with tab_export:
+            reviewed_schedule = st.session_state.get("reviewed_schedule_v11", core.add_manager_review_columns(schedule))
             approved_schedule, rejected_schedule, needs_review_schedule = core.split_reviewed_schedule(reviewed_schedule)
-            render_export_tab(approved_schedule, reviewed_schedule, schedule, unassigned, alerts, price_suggestions, move_messages, time_learning, actuals, resources, points_df, bookings_raw, sheet_id, use_google_sheets_master)
+            render_export(approved_schedule, reviewed_schedule, schedule, unassigned, alerts, price_suggestions, move_messages, time_learning, actuals, resources, points_df, bookings_raw, sheet_id, use_google_sheets_master)
 
     except Exception as exc:
         st.error(f"Could not optimize schedule: {exc}")
