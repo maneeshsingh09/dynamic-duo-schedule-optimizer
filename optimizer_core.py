@@ -1,5 +1,5 @@
 """
-Dynamic Duo Cleaning - Schedule Optimizer v7
+Dynamic Duo Cleaning - Schedule Optimizer v17
 
 Run locally:
     pip install -r requirements.txt
@@ -36,9 +36,10 @@ try:
 except Exception:  # pragma: no cover
     pdk = None
 
-APP_TITLE = "Dynamic Duo Cleaning - Schedule Optimizer v7"
+APP_TITLE = "Dynamic Duo Cleaning - Schedule Optimizer v17"
 DEFAULT_START = "08:30"
 DEFAULT_END = "17:00"
+DEFAULT_MIN_GAP_MINUTES = 30
 WEEKDAY_ORDER = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 DAY_LABEL = {d: d.title() for d in WEEKDAY_ORDER}
 MILES_PER_METER = 0.000621371
@@ -135,11 +136,55 @@ def parse_date(value: Any) -> Optional[date]:
     except Exception:
         return None
 
+def parse_datetime_any(value: Any) -> Optional[datetime]:
+    """Parse ISO or common BookingKoala date/time values."""
+    if pd.isna(value) or str(value).strip() == "":
+        return None
+    raw = str(value).strip()
+    try:
+        if "T" in raw or re.search(r"\d{4}-\d{2}-\d{2}", raw):
+            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        pass
+    try:
+        parsed = pd.to_datetime(raw, errors="coerce")
+        if pd.isna(parsed):
+            return None
+        return parsed.to_pydatetime()
+    except Exception:
+        return None
+
+
+def datetime_diff_minutes(start_value: Any, end_value: Any) -> float:
+    start = parse_datetime_any(start_value)
+    end = parse_datetime_any(end_value)
+    if start is None or end is None:
+        return 0.0
+    try:
+        mins = (end - start).total_seconds() / 60.0
+        return mins if mins > 0 else 0.0
+    except Exception:
+        return 0.0
+
 
 def parse_time_to_minutes(value: Any, default: str = DEFAULT_START) -> int:
     if pd.isna(value) or str(value).strip() == "":
         value = default
-    raw = str(value).strip().lower().replace(".", "")
+    raw_original = str(value).strip()
+    raw = raw_original.lower().replace(".", "")
+
+    # BookingKoala exports ISO datetime strings like 2026-05-05T12:00:00-05:00.
+    try:
+        if "t" in raw and re.search(r"\d{4}-\d{2}-\d{2}", raw):
+            dt = datetime.fromisoformat(raw_original.replace("Z", "+00:00"))
+            return dt.hour * 60 + dt.minute
+    except Exception:
+        pass
+
+    # BookingKoala Time column often looks like "09:00 AM - 11:00 AM".
+    if " - " in raw_original:
+        raw = raw_original.split(" - ", 1)[0].strip().lower().replace(".", "")
+
     for fmt in ("%H:%M", "%H%M", "%I:%M %p", "%I %p", "%I%p"):
         try:
             t = datetime.strptime(raw, fmt)
@@ -158,6 +203,89 @@ def parse_time_to_minutes(value: Any, default: str = DEFAULT_START) -> int:
         return hour * 60 + minute
     return parse_time_to_minutes(default, DEFAULT_START)
 
+
+
+
+def parse_duration_to_minutes(value: Any, default: float = 0.0) -> float:
+    """Parse BookingKoala-style durations into minutes.
+
+    Handles values like:
+    - 3 Hr 53 Min
+    - 3h 53m
+    - 3:53
+    - 233 min
+    - 3.88 hours
+    Numeric values <= 24 are treated as hours; larger numeric values are treated as minutes.
+    """
+    if pd.isna(value) or str(value).strip() == "":
+        return float(default)
+    raw = str(value).strip().lower()
+    raw = raw.replace("hours", "hr").replace("hour", "hr").replace("hrs", "hr")
+    raw = raw.replace("minutes", "min").replace("minute", "min").replace("mins", "min")
+    raw = raw.replace(" ", " ")
+
+    # 3:53 means 3 hours 53 minutes. 00:45 means 45 minutes.
+    m = re.match(r"^\s*(\d{1,2})\s*:\s*(\d{2})\s*$", raw)
+    if m:
+        return int(m.group(1)) * 60 + int(m.group(2))
+
+    hr_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:hr|h)\b", raw)
+    min_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:min|m)\b", raw)
+    if hr_match or min_match:
+        hours = float(hr_match.group(1)) if hr_match else 0.0
+        mins = float(min_match.group(1)) if min_match else 0.0
+        return hours * 60 + mins
+
+    # Phrases like "3 hr 53" after export cleanup.
+    parts = re.findall(r"\d+(?:\.\d+)?", raw)
+    if len(parts) >= 2 and any(tok in raw for tok in ["hr", "h"]):
+        return float(parts[0]) * 60 + float(parts[1])
+
+    val = parse_float(raw, default)
+    if val <= 0:
+        return float(default)
+    return val if val > 24 else val * 60
+
+
+def parse_worker_count(*values: Any, default: int = 1) -> int:
+    """Infer cleaner count from numeric or name-list fields."""
+    for value in values:
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            continue
+        raw = str(value).strip()
+        if not raw:
+            continue
+        nums = re.findall(r"\d+", raw)
+        if nums and any(w in raw.lower() for w in ["cleaner", "cleaners", "staff", "worker", "workers", "maid", "maids", "person", "people"]):
+            return max(1, int(nums[0]))
+        if re.fullmatch(r"\d+(?:\.0)?", raw):
+            return max(1, int(float(raw)))
+        # Name lists: Isabel, Jacky OR Isabel/Jacky OR Billy + Eduardo.
+        # BookingKoala provider lists include IDs like "6460: Billy Taylor, 6569: Eduardo Lopez".
+        raw_names = re.sub(r"\b\d+\s*:\s*", "", raw)
+        if any(sep in raw_names for sep in [",", ";", "|", "+", "&", "/"]):
+            cleaned = re.sub(r"\band\b", ",", raw_names, flags=re.I)
+            names = [x.strip() for x in re.split(r"[,;|+&/]+", cleaned) if x.strip()]
+            # Ignore values that look like addresses or dates.
+            if 1 < len(names) <= 6 and not any(re.search(r"\d{3,}", n) for n in names):
+                return len(names)
+    return max(1, int(default))
+
+
+def looks_like_time(value: Any) -> bool:
+    if pd.isna(value) or str(value).strip() == "":
+        return False
+    raw = str(value).strip().lower()
+    if "t" in raw and re.search(r"\d{4}-\d{2}-\d{2}", raw):
+        return True
+    return bool(re.search(r"\d{1,2}\s*:?\s*\d{0,2}\s*(am|pm)\b", raw) or re.fullmatch(r"\d{1,2}:\d{2}", raw))
+
+
+def add_minutes_to_time_string(value: Any, minutes: float) -> str:
+    if not looks_like_time(value):
+        return ""
+    start = parse_time_to_minutes(value, DEFAULT_START)
+    return minutes_to_time(start + minutes)
 
 def minutes_to_time(value: Optional[float]) -> str:
     if value is None or (isinstance(value, float) and math.isnan(value)):
@@ -268,17 +396,43 @@ CLEANER_ALIASES = {
 }
 
 BOOKING_ALIASES = {
-    "customer": "client", "customer_name": "client", "full_name": "client", "name": "client",
-    "service_address": "address", "client_address": "address", "home_address": "address", "location": "address",
-    "date": "service_date", "booking_date": "service_date", "appointment_date": "service_date", "cleaning_date": "service_date",
+    "customer": "client", "customer_name": "client", "full_name": "client", "name": "client", "client_name": "client",
+    "service_address": "address", "client_address": "address", "home_address": "address", "location": "address", "full_address": "address",
+    "date": "service_date", "booking_date": "service_date", "appointment_date": "service_date", "cleaning_date": "service_date", "service_date_time": "service_date",
     "day": "preferred_day", "requested_day": "preferred_day", "preferred_date": "service_date",
-    "service": "cleaning_type", "service_type": "cleaning_type", "type": "cleaning_type",
-    "hours": "job_hours", "estimated_hours": "job_hours", "duration": "job_hours", "job_duration": "job_hours", "person_hours": "job_hours",
-    "time": "time_window", "preferred_time": "time_window", "arrival_window": "time_window",
+    "service": "cleaning_type", "service_type": "cleaning_type", "type": "cleaning_type", "booking_type": "cleaning_type",
+
+    # Manual/person-hour fields
+    "hours": "job_hours", "estimated_hours": "job_hours", "person_hours": "job_hours", "job_hours": "job_hours",
+
+    # BookingKoala appointment duration fields. These are usually real clock duration for the booked team.
+    "duration": "appointment_duration", "job_duration": "appointment_duration", "appointment_duration": "appointment_duration",
+    "service_duration": "appointment_duration", "booking_duration": "appointment_duration", "estimated_duration": "appointment_duration",
+    "total_duration": "appointment_duration", "duration_hours": "appointment_duration", "duration_hrs": "appointment_duration",
+    "duration_minutes": "appointment_duration", "duration_mins": "appointment_duration", "duration_min": "appointment_duration",
+
+    # Start/end time fields from BookingKoala exports.
+    "time": "booking_time", "booking_time": "booking_time", "appointment_time": "booking_time", "scheduled_time": "booking_time", "service_time": "booking_time",
+    "booking_start_date_time": "booking_start_datetime", "booking_end_date_time": "booking_end_datetime",
+    "estimated_job_length_hh_mm": "bookingkoala_estimated_length",
+    "start": "earliest_start", "start_time": "earliest_start", "appointment_start": "earliest_start", "service_start": "earliest_start", "scheduled_start": "earliest_start", "booking_start": "earliest_start", "arrival_start": "earliest_start",
+    "end": "latest_finish", "end_time": "latest_finish", "appointment_end": "latest_finish", "service_end": "latest_finish", "scheduled_end": "latest_finish", "booking_end": "latest_finish", "arrival_end": "latest_finish",
+    "preferred_time": "time_window", "arrival_window": "time_window", "time_window": "time_window",
+
     "can_move": "can_shift", "flexible": "can_shift", "shiftable": "can_shift",
-    "price": "job_price", "quote": "job_price", "quoted_price": "job_price", "amount": "job_price", "total": "job_price",
-    "assigned_cleaner": "preferred_resource", "regular_cleaner": "preferred_resource", "staff": "preferred_resource", "team": "preferred_resource",
-    "preferred_cleaner": "preferred_resource", "preferred_team": "preferred_resource",
+    "booking_note": "notes", "private_customer_note": "private_customer_notes", "provider_note": "provider_notes", "booking_id": "booking_id",
+    "status": "booking_status", "booking_status": "booking_status", "lead_status": "booking_status", "hold_status": "booking_status",
+    "hold_id": "hold_id", "live_booking_id": "hold_id", "source": "booking_source", "booking_source": "booking_source",
+    "price": "job_price", "quote": "job_price", "quoted_price": "job_price", "amount": "job_price", "total": "job_price", "total_price": "job_price", "booking_total": "job_price",
+    "final_amount_usd": "job_price", "service_total_usd": "service_total", "price_adjustment": "price_adjustment",
+
+    # Current/required cleaner information in BookingKoala exports.
+    "assigned_cleaner": "assigned_workers", "assigned_cleaners": "assigned_workers", "assigned_staff": "assigned_workers", "assigned_team": "assigned_workers",
+    "provider": "assigned_workers", "providers": "assigned_workers", "provider_team": "assigned_workers", "staff": "assigned_workers", "team": "assigned_workers", "maids": "assigned_workers", "cleaners": "assigned_workers",
+    "number_of_cleaners": "original_worker_count", "cleaner_count": "original_worker_count", "cleaners_count": "original_worker_count",
+    "staff_count": "original_worker_count", "worker_count": "original_worker_count", "workers": "original_worker_count", "team_size": "original_worker_count", "number_of_maids": "original_worker_count",
+
+    "regular_cleaner": "preferred_resource", "preferred_cleaner": "preferred_resource", "preferred_team": "preferred_resource", "preferred_resource": "preferred_resource",
     "must_keep_cleaner": "lock_resource", "same_cleaner": "lock_resource", "locked_cleaner": "lock_resource", "cleaner_lock": "lock_resource",
     "risk": "risk_level", "overrun_risk": "risk_level", "difficulty": "difficulty_level", "buffer": "buffer_minutes",
     "extra_minutes": "buffer_minutes", "priority_level": "priority",
@@ -412,24 +566,115 @@ def prepare_bookings(raw: pd.DataFrame) -> pd.DataFrame:
     df = normalize_columns(raw, BOOKING_ALIASES)
     if "client" not in df.columns or "address" not in df.columns:
         raise ValueError("Bookings CSV must include client and address columns.")
-    if "job_hours" not in df.columns:
-        df["job_hours"] = 2.5
+
     optional_cols = [
-        "service_date", "preferred_day", "flexible_days", "time_window", "cleaning_type", "can_shift",
+        "service_date", "preferred_day", "flexible_days", "time_window", "booking_time", "cleaning_type", "can_shift",
         "notes", "earliest_start", "latest_finish", "frequency", "preferred_resource", "lock_resource",
         "job_price", "risk_level", "difficulty_level", "buffer_minutes", "priority", "min_workers", "max_workers",
-        "requires_team", "recurrence_interval_weeks", "client_flexibility",
+        "requires_team", "recurrence_interval_weeks", "client_flexibility", "job_hours", "appointment_duration",
+        "booking_start_datetime", "booking_end_datetime", "bookingkoala_estimated_length", "service_total",
+        "original_worker_count", "assigned_workers", "booking_status", "hold_id", "booking_source",
     ]
     for col in optional_cols:
         if col not in df.columns:
             df[col] = ""
         df[col] = df[col].fillna("")
+
     df["client"] = df["client"].astype(str).str.strip()
     df["client_key"] = df["client"].apply(key)
     df["address"] = df["address"].astype(str).str.strip()
     df["city"] = df["address"].apply(extract_city)
-    df["job_hours"] = df["job_hours"].apply(lambda x: max(0.25, parse_float(x, 2.5)))
-    df["job_mins"] = (df["job_hours"] * 60).round().astype(int)
+
+    # Exact BookingKoala export support:
+    # - Time is the arrival window (ex: 12:00 PM - 02:00 PM), not the job length.
+    # - Booking start/end is useful as the original calendar block.
+    # - Estimated job length (HH:MM) is treated as TOTAL ONE-PERSON LABOR TIME.
+    #   Simple rule requested by Dynamic Duo Cleaning:
+    #     1 assigned cleaner  -> duration = total labor time
+    #     2 assigned cleaners -> duration = total labor time / 2
+    #     3 assigned cleaners -> duration = total labor time / 3
+    for idx, row in df.iterrows():
+        start_dt = parse_datetime_any(row.get("booking_start_datetime", ""))
+        end_dt = parse_datetime_any(row.get("booking_end_datetime", ""))
+        if start_dt is not None:
+            if not str(row.get("service_date", "")).strip():
+                df.at[idx, "service_date"] = start_dt.date().isoformat()
+            # Use the scheduled start as the starting point when BookingKoala provides it.
+            df.at[idx, "earliest_start"] = row.get("booking_start_datetime", "")
+        if end_dt is not None:
+            # Keep original end for reference/debugging. The optimizer still recalculates actual duration
+            # from total labor time / assigned cleaner count.
+            df.at[idx, "latest_finish"] = row.get("booking_end_datetime", "")
+        if start_dt is not None and not str(row.get("time_window", "")).strip():
+            df.at[idx, "time_window"] = "Fixed"
+
+    # BookingKoala duration logic:
+    # Treat Estimated job length (HH:MM) as total one-person labor minutes, then divide by assigned team size later.
+    # Example: 07:45 total labor
+    #   - 1 cleaner  = 7h45m
+    #   - 2 cleaners = 3h53m
+    #   - 3 cleaners = 2h35m
+    appointment_mins: List[float] = []
+    original_workers: List[int] = []
+    person_mins: List[int] = []
+    duration_sources: List[str] = []
+    for _, row in df.iterrows():
+        block_mins = datetime_diff_minutes(row.get("booking_start_datetime", ""), row.get("booking_end_datetime", ""))
+        estimated_length_mins = parse_duration_to_minutes(row.get("bookingkoala_estimated_length", ""), 0.0)
+        explicit_appt_mins = parse_duration_to_minutes(row.get("appointment_duration", ""), 0.0)
+        workers = parse_worker_count(row.get("original_worker_count", ""), row.get("assigned_workers", ""), default=1)
+        manual_mins = parse_duration_to_minutes(row.get("job_hours", ""), 0.0)
+        workers = max(1, int(workers))
+
+        if estimated_length_mins > 0:
+            # Main BookingKoala rule: the CSV labor time is already total one-person labor.
+            base_person = int(round(estimated_length_mins))
+            appt = base_person / workers
+            source = f"BookingKoala Estimated job length as total labor ({round(base_person)} min ÷ {workers} cleaner(s))"
+            if block_mins > 0:
+                source += f"; original calendar block {round(block_mins)} min"
+        elif explicit_appt_mins > 0:
+            # Fallback if a duration exists but no Estimated job length column/value exists.
+            appt = explicit_appt_mins
+            base_person = int(round(appt * workers))
+            source = f"Fallback appointment duration × cleaners ({round(appt)} min × {workers})"
+        elif block_mins > 0:
+            # Last BookingKoala fallback: original calendar block × provider count.
+            appt = block_mins
+            base_person = int(round(appt * workers))
+            source = f"Fallback start/end block × cleaners ({round(appt)} min × {workers})"
+        elif manual_mins > 0:
+            appt = 0.0
+            base_person = int(round(manual_mins))
+            source = "Manual job_hours/person-hours"
+        else:
+            appt = 0.0
+            base_person = 150
+            source = "Default 2.5 person-hours"
+        appointment_mins.append(float(appt))
+        original_workers.append(int(workers))
+        person_mins.append(max(15, int(base_person)))
+        duration_sources.append(source)
+
+    df["bookingkoala_duration_mins"] = appointment_mins
+    df["bookingkoala_worker_count"] = original_workers
+    df["job_mins"] = person_mins
+    df["job_hours"] = (df["job_mins"] / 60).round(2)
+    df["duration_source"] = duration_sources
+
+    # If BookingKoala has a real scheduled time, use it instead of creating our own random time.
+    # Use the time as fixed unless the row clearly says it is flexible/can shift.
+    for idx, row in df.iterrows():
+        if (not str(row.get("earliest_start", "")).strip()) and looks_like_time(row.get("booking_time", "")):
+            df.at[idx, "earliest_start"] = row.get("booking_time", "")
+        # Do not auto-create latest_finish from duration. BookingKoala duration is a work block, not always a hard client latest finish.
+        # If the export has a real end_time/latest_finish column, it will still be respected.
+        if looks_like_time(df.at[idx, "earliest_start"]) and not str(row.get("time_window", "")).strip():
+            df.at[idx, "time_window"] = "Fixed"
+
+    # BookingKoala exports both Service total and Final amount. Use Final amount when present; otherwise Service total.
+    if "job_price" in df.columns and "service_total" in df.columns:
+        df["job_price"] = df.apply(lambda r: r.get("job_price") if str(r.get("job_price", "")).strip() else r.get("service_total", ""), axis=1)
     df["job_price_num"] = df["job_price"].apply(lambda x: max(0.0, parse_float(x, 0.0)))
     df["service_date_parsed"] = df["service_date"].apply(parse_date)
     df["preferred_day_list"] = df["preferred_day"].apply(split_days)
@@ -437,9 +682,13 @@ def prepare_bookings(raw: pd.DataFrame) -> pd.DataFrame:
     df["can_shift_bool"] = df["can_shift"].apply(truthy)
     df["lock_resource_bool"] = df["lock_resource"].apply(truthy)
     df["preferred_resource_key"] = df["preferred_resource"].apply(key)
+    df["assigned_workers_key"] = df["assigned_workers"].apply(key)
     df["min_workers_num"] = df["min_workers"].apply(lambda x: max(1, parse_int(x, 1)))
+    # original_worker_count is used to calculate person-time, not to force the same team size.
+    # Use min_workers/requires_team if a job truly must have multiple cleaners.
     df["max_workers_num"] = df["max_workers"].apply(lambda x: max(1, parse_int(x, 99)))
     df["requires_team_bool"] = df["requires_team"].apply(truthy)
+    df.loc[df["bookingkoala_worker_count"] > 1, "requires_team_bool"] = df.loc[df["bookingkoala_worker_count"] > 1, "requires_team_bool"].fillna(False)
     df["priority_rank"] = df["priority"].apply(priority_rank)
     risk_buffers = df.apply(calculate_risk_buffer_minutes, axis=1)
     df["buffer_mins"] = [x[0] for x in risk_buffers]
@@ -449,6 +698,7 @@ def prepare_bookings(raw: pd.DataFrame) -> pd.DataFrame:
     df["latest_finish_min"] = [x[1] for x in windows]
     df["time_window_label"] = [x[2] for x in windows]
     df["fixed_time_bool"] = [x[3] for x in windows]
+    df["scheduled_start_min"] = df["earliest_start"].apply(lambda x: parse_time_to_minutes(x, DEFAULT_START) if looks_like_time(x) else math.nan)
     return df
 
 
@@ -505,6 +755,73 @@ def prepare_crew_rules(raw: Optional[pd.DataFrame]) -> pd.DataFrame:
     df["hourly_cost_override_num"] = df["hourly_cost_override"].apply(lambda x: parse_float(x, -1.0))
     return df
 
+
+
+def generate_smart_temp_pair_crews(cleaners_raw: pd.DataFrame, crews_raw: Optional[pd.DataFrame], days: List[date], max_pairs: int = 12) -> pd.DataFrame:
+    """Build optional two-person teams for the optimizer.
+
+    This does not force two cleaners on every job. It simply gives the optimizer
+    legal team options so it can compare solo vs pair for large jobs. Fixed crews
+    and cleaners marked allow_solo=No are not mixed into random temporary pairs.
+    """
+    if cleaners_raw is None or cleaners_raw.empty:
+        return pd.DataFrame(columns=["resource_name", "members", "team_type", "available_days", "base_address", "can_split_after_job", "always_together", "carpool", "max_jobs_per_day", "max_hours_per_day", "start_time", "end_time", "productivity_multiplier", "hourly_cost_override"])
+    cleaners = prepare_cleaners(cleaners_raw)
+    try:
+        crews = prepare_crew_rules(crews_raw) if crews_raw is not None and not crews_raw.empty else pd.DataFrame()
+    except Exception:
+        crews = pd.DataFrame()
+
+    fixed_member_keys = set()
+    existing_resource_keys = set()
+    if crews is not None and not crews.empty:
+        existing_resource_keys = set(crews.get("resource_key", pd.Series(dtype=str)).astype(str))
+        for _, cr in crews.iterrows():
+            if bool(cr.get("always_together_bool", False)):
+                fixed_member_keys.update(cr.get("member_keys", []))
+
+    candidates = cleaners[(cleaners["allow_solo_bool"] == True) & (~cleaners["cleaner_key"].isin(fixed_member_keys))].copy()
+    if len(candidates) < 2:
+        return pd.DataFrame()
+
+    # Respect can_pair_with if provided; otherwise allow normal pair options.
+    rows = []
+    day_names = sorted({DAY_LABEL[date_to_day(d)] for d in days}) or ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    records = candidates.to_dict("records")
+    for i in range(len(records)):
+        for j in range(i + 1, len(records)):
+            a, b = records[i], records[j]
+            a_pairs = [key(x) for x in split_list(a.get("can_pair_with", ""))]
+            b_pairs = [key(x) for x in split_list(b.get("can_pair_with", ""))]
+            if a_pairs and b["cleaner_key"] not in a_pairs:
+                continue
+            if b_pairs and a["cleaner_key"] not in b_pairs:
+                continue
+            name = f"{a['cleaner']}/{b['cleaner']}"
+            rkey = key(name)
+            if rkey in existing_resource_keys:
+                continue
+            hourly = float(a.get("hourly_cost", 25.0)) + float(b.get("hourly_cost", 25.0))
+            # Use first cleaner base for the starting point. Split/join still gets flagged for review.
+            rows.append({
+                "resource_name": name,
+                "members": f"{a['cleaner']};{b['cleaner']}",
+                "team_type": "Smart Optional",
+                "available_days": ",".join(day_names),
+                "base_address": str(a.get("base_address", "")),
+                "can_split_after_job": "Yes",
+                "always_together": "No",
+                "carpool": "Yes",
+                "max_jobs_per_day": min(int(a.get("max_jobs_per_day", 3)), int(b.get("max_jobs_per_day", 3)), 4),
+                "max_hours_per_day": min(float(a.get("max_hours_per_day", 8)), float(b.get("max_hours_per_day", 8))),
+                "start_time": DEFAULT_START,
+                "end_time": DEFAULT_END,
+                "productivity_multiplier": 2,
+                "hourly_cost_override": hourly,
+            })
+            if len(rows) >= int(max_pairs):
+                return pd.DataFrame(rows)
+    return pd.DataFrame(rows)
 
 def prepare_area_memory(raw: Optional[pd.DataFrame]) -> pd.DataFrame:
     cols = ["area_keyword", "best_days", "avoid_days", "preferred_resources", "notes", "best_day_list", "avoid_day_list", "preferred_resource_keys"]
@@ -904,6 +1221,7 @@ def build_resources(cleaners: pd.DataFrame, crews: pd.DataFrame) -> Tuple[pd.Dat
             "can_split_after_job": crew["can_split_bool"],
             "always_together": crew["always_together_bool"],
             "carpool": crew["carpool_bool"],
+            "team_type": crew.get("team_type", "Optional"),
         })
 
     for _, cleaner in cleaners.iterrows():
@@ -930,6 +1248,7 @@ def build_resources(cleaners: pd.DataFrame, crews: pd.DataFrame) -> Tuple[pd.Dat
             "can_split_after_job": True,
             "always_together": False,
             "carpool": False,
+            "team_type": "Solo",
         })
 
     res_df = pd.DataFrame(resources)
@@ -1054,19 +1373,56 @@ def interval_overlaps(a_start: int, a_end: int, b_start: int, b_end: int) -> boo
     return max(a_start, b_start) < min(a_end, b_end)
 
 
-def member_conflict(member_events: Dict[Tuple[str, date], List[Tuple[int, int, str]]], member_keys: List[str], d: date, start: int, end: int) -> Optional[str]:
+def _event_parts(event: Tuple[Any, ...]) -> Tuple[int, int, str, str]:
+    s = int(event[0]) if len(event) > 0 else 0
+    e = int(event[1]) if len(event) > 1 else 0
+    label = str(event[2]) if len(event) > 2 else "existing job"
+    point_key = str(event[3]) if len(event) > 3 else ""
+    return s, e, label, point_key
+
+
+def member_conflict(member_events: Dict[Tuple[str, date], List[Tuple[Any, ...]]], member_keys: List[str], d: date, start: int, end: int) -> Optional[str]:
     for m in member_keys:
-        for s, e, label in member_events.get((m, d), []):
+        for ev in member_events.get((m, d), []):
+            s, e, label, _ = _event_parts(ev)
             if interval_overlaps(start, end, s, e):
                 return f"{m} overlaps with {label}"
+    return None
+
+
+def member_travel_conflict(member_events: Dict[Tuple[str, date], List[Tuple[Any, ...]]], member_keys: List[str], d: date, start: int, end: int, job_key: str, minutes: List[List[float]], point_idx: Dict[str, int], min_gap_minutes: int) -> Optional[str]:
+    """Ensure split/recombine team jobs have real travel gap for each member.
+
+    This prevents impossible schedules like a cleaner ending one solo job at 11:30
+    and instantly appearing on a paired job at 11:30 somewhere else.
+    """
+    if job_key not in point_idx:
+        return None
+    for m in member_keys:
+        for ev in member_events.get((m, d), []):
+            s, e, label, prev_point = _event_parts(ev)
+            if prev_point not in point_idx:
+                continue
+            if e <= start:
+                drive = minutes[point_idx[prev_point]][point_idx[job_key]]
+                if not math.isinf(drive) and e + int(min_gap_minutes) + int(math.ceil(drive)) > start:
+                    return f"{m} cannot reach from {label} with travel + {min_gap_minutes} min gap"
+            elif s >= end:
+                drive = minutes[point_idx[job_key]][point_idx[prev_point]]
+                if not math.isinf(drive) and end + int(min_gap_minutes) + int(math.ceil(drive)) > s:
+                    return f"{m} cannot reach next job {label} with travel + {min_gap_minutes} min gap"
     return None
 
 
 def actual_job_minutes(row: pd.Series, resource: Dict[str, Any], hours_are_person_hours: bool) -> int:
     base = int(row.get("job_mins", 150))
     buffer_mins = int(row.get("buffer_mins", 0))
-    if hours_are_person_hours:
-        effective_workers = max(1.0, float(resource.get("productivity_multiplier", resource.get("member_count", 1))))
+    effective_workers = max(1.0, float(resource.get("productivity_multiplier", resource.get("member_count", 1))))
+
+    # BookingKoala appointment durations are converted into person-minutes in prepare_bookings.
+    # Those should always be divided by the assigned team productivity.
+    from_bookingkoala = float(row.get("bookingkoala_duration_mins", 0) or 0) > 0 or "bookingkoala" in str(row.get("duration_source", "")).lower()
+    if from_bookingkoala or hours_are_person_hours:
         return int(math.ceil(base / effective_workers + buffer_mins))
     return int(base + buffer_mins)
 
@@ -1103,7 +1459,7 @@ def area_memory_adjustment(row: pd.Series, resource: Dict[str, Any], d: date, ar
     return adj, "; ".join(reasons)
 
 
-def evaluate_candidate(row: pd.Series, resource: Dict[str, Any], d: date, schedules: Dict[Tuple[str, date], List[Dict[str, Any]]], member_events: Dict[Tuple[str, date], List[Tuple[int, int, str]]], exceptions: pd.DataFrame, miles: List[List[float]], minutes: List[List[float]], point_idx: Dict[str, int], area_memory: pd.DataFrame, hours_are_person_hours: bool, mileage_cost: float, travel_hour_cost: float) -> Tuple[bool, Dict[str, Any]]:
+def evaluate_candidate(row: pd.Series, resource: Dict[str, Any], d: date, schedules: Dict[Tuple[str, date], List[Dict[str, Any]]], member_events: Dict[Tuple[str, date], List[Tuple[int, int, str]]], exceptions: pd.DataFrame, miles: List[List[float]], minutes: List[List[float]], point_idx: Dict[str, int], area_memory: pd.DataFrame, hours_are_person_hours: bool, mileage_cost: float, travel_hour_cost: float, min_gap_minutes: int = DEFAULT_MIN_GAP_MINUTES) -> Tuple[bool, Dict[str, Any]]:
     ok, avail_start, avail_end, avail_note = availability_for_resource(resource, d, exceptions)
     if not ok:
         return False, {"reason": avail_note}
@@ -1134,9 +1490,19 @@ def evaluate_candidate(row: pd.Series, resource: Dict[str, Any], d: date, schedu
     if math.isinf(travel_miles) or math.isinf(travel_minutes):
         return False, {"reason": "No route data"}
     prev_end = route[-1]["end_min"] if route else avail_start
-    arrival = prev_end + int(math.ceil(travel_minutes))
-    start = max(int(row.get("earliest_min", avail_start)), arrival, avail_start)
+    gap_after_prev = int(min_gap_minutes) if route else 0
+    arrival = prev_end + gap_after_prev + int(math.ceil(travel_minutes))
     duration = actual_job_minutes(row, resource, hours_are_person_hours)
+
+    scheduled_start = row.get("scheduled_start_min", math.nan)
+    if bool(row.get("fixed_time_bool")) and not pd.isna(scheduled_start):
+        start = max(int(scheduled_start), avail_start)
+        # For the first job, assume the cleaner leaves base early enough to arrive for the fixed BookingKoala time.
+        # For later jobs, enforce travel + 30-minute gap before the fixed start.
+        if route and arrival > start:
+            return False, {"reason": "Cannot reach fixed BookingKoala start time with travel/gap"}
+    else:
+        start = max(int(row.get("earliest_min", avail_start)), arrival, avail_start)
     end = start + duration
     if end > int(row.get("latest_finish_min", avail_end)):
         return False, {"reason": "Does not fit client time window"}
@@ -1148,6 +1514,9 @@ def evaluate_candidate(row: pd.Series, resource: Dict[str, Any], d: date, schedu
     conflict = member_conflict(member_events, list(resource.get("member_keys", [])), d, start, end)
     if conflict:
         return False, {"reason": conflict}
+    travel_conflict = member_travel_conflict(member_events, list(resource.get("member_keys", [])), d, start, end, job_key, minutes, point_idx, min_gap_minutes)
+    if travel_conflict:
+        return False, {"reason": travel_conflict}
 
     area_adj, area_reason = area_memory_adjustment(row, resource, d, area_memory)
     pref_bonus = 0.0
@@ -1158,9 +1527,22 @@ def evaluate_candidate(row: pd.Series, resource: Dict[str, Any], d: date, schedu
     shift_penalty = 0 if d == row.get("candidate_anchor_date") else 18
     priority_penalty = float(row.get("priority_rank", 2)) * 1.0
     team_penalty = 0.0
+    person_hours = float(row.get("job_mins", 0) or 0) / 60.0
+    member_count = int(resource.get("member_count", 1) or 1)
     if resource.get("resource_type") == "Crew" and not bool(row.get("requires_team_bool")) and int(row.get("min_workers_num", 1)) <= 1:
-        # Don't use crews on tiny jobs unless it still helps route/profit.
-        team_penalty += 4
+        # Smart solo/team rule:
+        # - small jobs should normally stay solo unless the pair is extremely close
+        # - larger jobs can use a pair because it shortens the appointment block
+        if person_hours <= 2.25:
+            team_penalty += 14
+        elif person_hours <= 3.5:
+            team_penalty += 6
+        elif person_hours >= 7.0 and member_count >= 2:
+            team_penalty -= 14
+        elif person_hours >= 5.0 and member_count >= 2:
+            team_penalty -= 8
+        elif person_hours >= 4.0 and member_count >= 2:
+            team_penalty -= 4
     score = travel_miles + (travel_minutes / 8) + shift_penalty + priority_penalty + pref_bonus + area_adj + team_penalty
     if str(row.get("time_window_label", "")).lower() in {"fixed", "morning"}:
         score -= 2
@@ -1191,6 +1573,13 @@ def evaluate_candidate(row: pd.Series, resource: Dict[str, Any], d: date, schedu
         "duration_hours": round(duration / 60, 2),
         "travel_miles": round(travel_miles, 1),
         "travel_minutes": round(travel_minutes, 0),
+        "gap_after_prev_mins": gap_after_prev,
+        "bookingkoala_duration_mins": round(float(row.get("bookingkoala_duration_mins", 0) or 0), 0),
+        "bookingkoala_worker_count": int(row.get("bookingkoala_worker_count", 1) or 1),
+        "assigned_worker_count": int(resource.get("member_count", 1) or 1),
+        "team_decision": ("Team" if int(resource.get("member_count", 1) or 1) >= 2 else "Solo"),
+        "original_person_hours": round(float(row.get("job_mins", 0) or 0) / 60, 2),
+        "duration_source": row.get("duration_source", ""),
         "job_price": float(row.get("job_price_num", 0.0)),
         "labor_cost": round(labor_cost, 2),
         "travel_cost": round(travel_cost, 2),
@@ -1208,7 +1597,7 @@ def evaluate_candidate(row: pd.Series, resource: Dict[str, Any], d: date, schedu
     }
 
 
-def optimize_schedule(bookings_inst: pd.DataFrame, resources: pd.DataFrame, dates: List[date], exceptions: pd.DataFrame, miles: List[List[float]], minutes: List[List[float]], point_idx: Dict[str, int], area_memory: pd.DataFrame, hours_are_person_hours: bool, mileage_cost: float, travel_hour_cost: float) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[Tuple[str, date], List[Dict[str, Any]]], Dict[Tuple[str, date], List[Tuple[int, int, str]]]]:
+def optimize_schedule(bookings_inst: pd.DataFrame, resources: pd.DataFrame, dates: List[date], exceptions: pd.DataFrame, miles: List[List[float]], minutes: List[List[float]], point_idx: Dict[str, int], area_memory: pd.DataFrame, hours_are_person_hours: bool, mileage_cost: float, travel_hour_cost: float, min_gap_minutes: int = DEFAULT_MIN_GAP_MINUTES) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[Tuple[str, date], List[Dict[str, Any]]], Dict[Tuple[str, date], List[Tuple[int, int, str]]]]:
     schedules: Dict[Tuple[str, date], List[Dict[str, Any]]] = {}
     member_events: Dict[Tuple[str, date], List[Tuple[int, int, str]]] = {}
     assigned: List[Dict[str, Any]] = []
@@ -1229,7 +1618,7 @@ def optimize_schedule(bookings_inst: pd.DataFrame, resources: pd.DataFrame, date
         for d in cdates:
             for _, res_row in resources.iterrows():
                 resource = res_row.to_dict()
-                ok, cand = evaluate_candidate(row, resource, d, schedules, member_events, exceptions, miles, minutes, point_idx, area_memory, hours_are_person_hours, mileage_cost, travel_hour_cost)
+                ok, cand = evaluate_candidate(row, resource, d, schedules, member_events, exceptions, miles, minutes, point_idx, area_memory, hours_are_person_hours, mileage_cost, travel_hour_cost, min_gap_minutes)
                 if ok:
                     if best is None or float(cand["score"]) < float(best["score"]):
                         best = cand
@@ -1241,7 +1630,7 @@ def optimize_schedule(bookings_inst: pd.DataFrame, resources: pd.DataFrame, date
             schedules.setdefault((best["resource_key"], best["date"]), []).append(best)
             schedules[(best["resource_key"], best["date"])].sort(key=lambda x: x["start_min"])
             for m in best["member_keys"]:
-                member_events.setdefault((m, best["date"]), []).append((best["start_min"], best["end_min"], str(best["client"])))
+                member_events.setdefault((m, best["date"]), []).append((best["start_min"], best["end_min"], str(best["client"]), str(best.get("point_key", ""))))
             assigned.append(best)
         else:
             unassigned.append({
@@ -1329,6 +1718,156 @@ def make_points(resources: pd.DataFrame, bookings_inst: pd.DataFrame, api_key: s
 # -----------------------------
 # Suggestions, text messages, maps, exports
 # -----------------------------
+
+
+def _member_list_from_value(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(x) for x in value if str(x)]
+    if pd.isna(value):
+        return []
+    raw = str(value)
+    raw = raw.strip("[]")
+    return [x.strip().strip("'\"") for x in re.split(r"[,;/|]+", raw) if x.strip().strip("'\"")]
+
+
+def _member_name_lookup(resources: pd.DataFrame) -> Dict[str, str]:
+    lookup: Dict[str, str] = {}
+    if resources is None or resources.empty:
+        return lookup
+    for _, r in resources.iterrows():
+        names = [x.strip() for x in re.split(r"[,;/|]+", str(r.get("members", ""))) if x.strip()]
+        keys = r.get("member_keys", [])
+        if not isinstance(keys, list):
+            keys = _member_list_from_value(keys)
+        for idx, mk in enumerate(keys):
+            lookup[str(mk)] = names[idx] if idx < len(names) else str(mk).replace("_", " ").title()
+    return lookup
+
+
+def helper_join_suggestions_for_target(target: Dict[str, Any], schedule: pd.DataFrame, resources: pd.DataFrame, miles: List[List[float]], minutes: List[List[float]], point_idx: Dict[str, int], min_gap_minutes: int = DEFAULT_MIN_GAP_MINUTES, max_join_drive_minutes: int = 25, min_time_saved_minutes: int = 30, min_remaining_person_minutes: int = 90) -> pd.DataFrame:
+    """Suggest a helper joining an existing/new job after finishing nearby.
+
+    This is advisory only. It does not automatically rewrite the schedule, because
+    join-later jobs need human confirmation and BookingKoala may not represent them cleanly.
+    """
+    if schedule is None or schedule.empty or not target:
+        return pd.DataFrame()
+    try:
+        target_date = target.get("date")
+        if isinstance(target_date, pd.Timestamp):
+            target_date = target_date.date()
+        elif not isinstance(target_date, date):
+            target_date = pd.to_datetime(str(target_date)).date()
+        target_start = int(target.get("start_min"))
+        target_end = int(target.get("end_min"))
+        target_point = str(target.get("point_key"))
+        target_person_mins = float(target.get("original_person_hours", 0) or 0) * 60.0
+        if target_person_mins <= 0:
+            target_person_mins = float(target.get("duration_mins", 0) or 0) * max(1, int(target.get("assigned_worker_count", 1) or 1))
+        current_members = _member_list_from_value(target.get("member_keys", []))
+        current_workers = max(1, len(current_members) or int(target.get("assigned_worker_count", 1) or 1))
+        if target_person_mins < 240:  # not worth coordinating a join-later assist for small jobs
+            return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+    member_names = _member_name_lookup(resources)
+    all_members = sorted(set(member_names.keys()))
+    rows: List[Dict[str, Any]] = []
+    day_schedule = schedule[schedule["date"].astype(str) == str(target_date)].copy()
+    if day_schedule.empty:
+        return pd.DataFrame()
+
+    def row_members(rr: pd.Series) -> List[str]:
+        return _member_list_from_value(rr.get("member_keys", []))
+
+    for helper in all_members:
+        if helper in current_members:
+            continue
+        helper_rows = day_schedule[day_schedule.apply(lambda rr: helper in row_members(rr), axis=1)].copy()
+        if helper_rows.empty:
+            continue
+        helper_rows = helper_rows.sort_values("end_min")
+        # Find jobs the helper finishes while the target job is still in progress.
+        prior_options = helper_rows[(helper_rows["end_min"] >= target_start - 15) & (helper_rows["end_min"] <= target_end - 30)].copy()
+        for _, prior in prior_options.iterrows():
+            if str(prior.get("instance_id", "")) == str(target.get("instance_id", "")):
+                continue
+            from_key = str(prior.get("point_key", ""))
+            if from_key not in point_idx or target_point not in point_idx:
+                continue
+            drive_min = float(minutes[point_idx[from_key]][point_idx[target_point]])
+            drive_mi = float(miles[point_idx[from_key]][point_idx[target_point]])
+            if math.isinf(drive_min) or drive_min > max_join_drive_minutes:
+                continue
+            arrival = int(prior.get("end_min", 0)) + int(min_gap_minutes) + int(math.ceil(drive_min))
+            if arrival <= target_start + 15 or arrival >= target_end - 30:
+                continue
+            completed_person_mins = max(0, arrival - target_start) * current_workers
+            remaining_person_mins = target_person_mins - completed_person_mins
+            if remaining_person_mins < min_remaining_person_minutes:
+                continue
+            new_finish = int(math.ceil(arrival + remaining_person_mins / (current_workers + 1)))
+            saved = target_end - new_finish
+            if saved < min_time_saved_minutes:
+                continue
+            # Make sure the helper can still reach their next already-scheduled job.
+            next_rows = helper_rows[helper_rows["start_min"] > prior.get("end_min", 0)].sort_values("start_min")
+            next_note = "No later helper job found"
+            feasible_next = True
+            if not next_rows.empty:
+                nxt = next_rows.iloc[0]
+                # If the next job is the target itself, skip to the following one.
+                if str(nxt.get("instance_id", "")) == str(target.get("instance_id", "")) and len(next_rows) > 1:
+                    nxt = next_rows.iloc[1]
+                next_key = str(nxt.get("point_key", ""))
+                if next_key in point_idx and target_point in point_idx:
+                    back_drive = float(minutes[point_idx[target_point]][point_idx[next_key]])
+                    reach_next = new_finish + int(min_gap_minutes) + int(math.ceil(back_drive))
+                    feasible_next = reach_next <= int(nxt.get("start_min", 0))
+                    next_note = f"Next job: {nxt.get('client','')} at {minutes_to_time(nxt.get('start_min'))}; can reach: {'Yes' if feasible_next else 'No'}"
+            if not feasible_next:
+                continue
+            rows.append({
+                "date": target_date,
+                "client": target.get("client", ""),
+                "current_resource": target.get("resource", ""),
+                "helper": member_names.get(helper, helper),
+                "helper_after_job": prior.get("client", ""),
+                "helper_drive_miles": round(drive_mi, 1),
+                "helper_drive_minutes": round(drive_min, 0),
+                "helper_arrival": minutes_to_time(arrival),
+                "original_finish": minutes_to_time(target_end),
+                "estimated_finish_with_helper": minutes_to_time(new_finish),
+                "time_saved_minutes": int(round(saved)),
+                "recommendation": "Good assist option" if saved >= 45 and drive_min <= 20 else "Possible assist - review",
+                "next_job_check": next_note,
+            })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(["time_saved_minutes", "helper_drive_minutes"], ascending=[False, True]).reset_index(drop=True)
+
+
+def build_team_assist_suggestions(schedule: pd.DataFrame, resources: pd.DataFrame, miles: List[List[float]], minutes: List[List[float]], point_idx: Dict[str, int], min_gap_minutes: int = DEFAULT_MIN_GAP_MINUTES) -> pd.DataFrame:
+    if schedule is None or schedule.empty:
+        return pd.DataFrame()
+    pieces = []
+    # Focus on larger jobs and jobs currently handled solo/small team.
+    for _, rr in schedule.iterrows():
+        person_hours = float(rr.get("original_person_hours", 0) or 0)
+        assigned_workers = int(rr.get("assigned_worker_count", 1) or 1)
+        if person_hours < 4.0:
+            continue
+        if assigned_workers >= 3 and person_hours < 8.0:
+            continue
+        target = rr.to_dict()
+        sug = helper_join_suggestions_for_target(target, schedule, resources, miles, minutes, point_idx, min_gap_minutes=min_gap_minutes)
+        if not sug.empty:
+            pieces.append(sug)
+    if not pieces:
+        return pd.DataFrame()
+    return pd.concat(pieces, ignore_index=True).drop_duplicates(subset=["date", "client", "helper", "helper_arrival"]).head(25)
 
 def price_adjustment_suggestions(schedule: pd.DataFrame, min_profit: float, long_drive_miles: float) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
@@ -1544,6 +2083,8 @@ MASTER_SHEET_TABS = {
     # Shared weekly bookings used by both admins.
     "bookings": "Active Bookings",
     "active_meta": "Active Week Metadata",
+    "live_bookings": "Live Bookings",
+    "booking_decisions": "Booking Decisions",
     "approved": "Approved Schedule",
     "reviewed": "Reviewed Schedule",
     "manager_review": "Manager Review",
@@ -1703,6 +2244,7 @@ def load_master_data(sheet_id: str, use_sheets: bool, files: Dict[str, Any]) -> 
         "area": default_area_memory(),
         "actuals": pd.DataFrame(),
         "bookings": default_bookings(),
+        "live_bookings": pd.DataFrame(),
     }
     out: Dict[str, pd.DataFrame] = {}
 
@@ -1733,6 +2275,17 @@ def load_master_data(sheet_id: str, use_sheets: bool, files: Dict[str, Any]) -> 
             else:
                 out[name] = defaults[name]
             statuses.append(f"{tab}: using {'sample/default' if name != 'exceptions' else 'blank'} data")
+
+    # Live Bookings are the new daily planning layer: pending holds and confirmed
+    # bookings created from the New Booking Planner. They are included in the
+    # optimizer unless cancelled/rejected, so future suggestions do not ignore
+    # bookings you already offered to clients.
+    if use_sheets:
+        out["live_bookings"], status = read_google_tab(sheet_id, MASTER_SHEET_TABS["live_bookings"], defaults["live_bookings"])
+        statuses.append(status)
+    else:
+        out["live_bookings"] = defaults["live_bookings"]
+        statuses.append("Live Bookings: using blank data")
     return out, statuses
 
 
@@ -1767,6 +2320,85 @@ def write_google_tab(sheet_id: str, tab_name: str, df: pd.DataFrame) -> str:
         except TypeError:
             ws.update(values)
     return f"Saved {len(values)-1} row(s) to {tab_name}."
+
+
+
+def active_live_status(value: Any) -> bool:
+    """Whether a live booking should be counted as holding space in future schedules."""
+    status = str(value or "").strip().lower()
+    if not status:
+        return True
+    return status not in {"rejected", "reject", "cancelled", "canceled", "lost", "released", "deleted"}
+
+
+def combine_active_and_live_bookings(active_bookings: pd.DataFrame, live_bookings: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Combine uploaded/active BookingKoala rows with saved live holds/confirmed leads.
+
+    Active Bookings remains the BookingKoala export. Live Bookings is the day-to-day
+    decision layer where admins save pending or confirmed new jobs before they are
+    fully reflected in BookingKoala.
+    """
+    parts: List[pd.DataFrame] = []
+    if active_bookings is not None and not active_bookings.empty:
+        a = active_bookings.copy()
+        if "booking_source" not in a.columns:
+            a.insert(0, "booking_source", "BookingKoala Active Schedule")
+        if "booking_status" not in a.columns:
+            a.insert(1, "booking_status", "Confirmed")
+        parts.append(a)
+    if live_bookings is not None and not live_bookings.empty:
+        l = normalize_columns(live_bookings.copy(), BOOKING_ALIASES)
+        if "booking_status" not in l.columns:
+            l["booking_status"] = "Pending"
+        l = l[l["booking_status"].apply(active_live_status)].copy()
+        if not l.empty:
+            if "booking_source" not in l.columns:
+                l.insert(0, "booking_source", "Live Booking Planner")
+            parts.append(l)
+    if not parts:
+        return pd.DataFrame()
+    return pd.concat(parts, ignore_index=True, sort=False)
+
+
+def append_google_tab(sheet_id: str, tab_name: str, row_df: pd.DataFrame) -> str:
+    """Append rows to a Google Sheet tab, creating the tab/header if needed."""
+    ok, msg = google_sheets_configured(sheet_id)
+    if not ok:
+        return msg
+    existing, _ = read_google_tab(sheet_id, tab_name, pd.DataFrame())
+    if existing is None or existing.empty or list(existing.columns) == ["message"]:
+        combined = row_df.copy()
+    else:
+        combined = pd.concat([existing, row_df], ignore_index=True, sort=False)
+    return write_google_tab(sheet_id, tab_name, combined)
+
+
+def build_booking_decision_row(new_row: Dict[str, Any], selected_option: Dict[str, Any], suggestions: pd.DataFrame, decision_status: str, admin_name: str = "Admin") -> pd.DataFrame:
+    """Create one audit row showing why a live booking was placed in a slot."""
+    top = suggestions.head(5).copy() if suggestions is not None and not suggestions.empty else pd.DataFrame()
+    alt_summary = ""
+    if not top.empty:
+        bits = []
+        for _, r in top.iterrows():
+            bits.append(f"{r.get('day')} {r.get('start')} {r.get('resource')} {r.get('travel_miles')}mi score {round(float(r.get('score', 0)),1)}")
+        alt_summary = " | ".join(bits)
+    return pd.DataFrame([{
+        "decision_time": datetime.now().isoformat(timespec="seconds"),
+        "admin": admin_name or "Admin",
+        "decision_status": decision_status,
+        "client": new_row.get("client", ""),
+        "address": new_row.get("address", ""),
+        "chosen_date": selected_option.get("date", ""),
+        "chosen_day": selected_option.get("day", ""),
+        "chosen_start": selected_option.get("start", ""),
+        "chosen_end": selected_option.get("end", ""),
+        "chosen_resource": selected_option.get("resource", ""),
+        "assigned_worker_count": selected_option.get("assigned_worker_count", ""),
+        "travel_miles": selected_option.get("travel_miles", ""),
+        "profit_score": selected_option.get("profit_score", ""),
+        "reason": selected_option.get("why_this_option", selected_option.get("score_notes", "")),
+        "top_options": alt_summary,
+    }])
 
 # -----------------------------
 # Sample/default data

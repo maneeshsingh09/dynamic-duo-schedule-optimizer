@@ -1,35 +1,42 @@
-# Dynamic Duo Cleaning Schedule Planner v11
+# Dynamic Duo Cleaning - Schedule Planner v17
 
-Simplified Streamlit version focused on the real workflow:
+This version changes the app from only a weekly optimizer into a live future scheduling planner.
 
-1. Upload BookingKoala/GHL weekly CSV
-2. Save as Active Week for both admins, if Google Sheets is connected
-3. Build day-by-day cleaner/team routes
-4. Review/approve schedule by day
-5. Use New Booking Checker before confirming new jobs
-6. Export approved schedule / cleaner texts
+## Main workflow
 
-## Main files
+1. Export BookingKoala bookings for the next 1-4 weeks.
+2. Upload the CSV in the app.
+3. Click **Save as Future Schedule** so both admins use the same shared schedule.
+4. The app builds the recommended cleaner/team schedule by day using addresses, cleaner locations, Google routing, job labor hours, and the 30-minute minimum gap.
+5. During the week, use **Live Booking Planner** before confirming a new lead.
+6. Save the selected option as **Pending Hold** or **Confirmed**. The app writes it to the **Live Bookings** Google Sheet tab so future suggestions treat that slot as occupied/held.
+7. Weekend review should become exception-only: check unassigned/problem jobs, not rebuild the whole schedule manually.
 
-- `app.py` — Streamlit app
-- `optimizer_core.py` — scheduling and Google Sheets/Maps helper logic
-- `requirements.txt` — packages for Streamlit Cloud
-- `dynamic_duo_google_sheets_master_template.xlsx` — Google Sheets master template
+## Google Sheet tabs
 
-## Streamlit entrypoint
+Existing tabs still work. v17 will create these automatically if they do not exist:
 
-Use:
+- Live Bookings
+- Booking Decisions
 
-```text
-app.py
-```
+`Live Bookings` stores pending holds and confirmed additions created from the planner. `Booking Decisions` logs the chosen slot and top alternatives so admins can understand why a booking was placed there.
 
-## Google routing note
+## Duration logic
 
-The app works without Google routing by using approximate fallback miles. To use real driving miles, create a Google Maps API key that can call:
+BookingKoala `Estimated job length (HH:MM)` is treated as total one-person labor time.
 
-- Routes API
-- Geocoding API
-- Distance Matrix API (Legacy), optional backup
+- 1 cleaner = full labor time
+- 2 cleaners = half
+- 3 cleaners = one-third
 
-While testing, keep Application restrictions as `None`; after it works, restrict the key safely.
+The scheduler also adds the configured minimum gap between jobs, default 30 minutes, plus travel time.
+
+## Files to upload to GitHub
+
+Replace at least:
+
+- app.py
+- optimizer_core.py
+- README.md
+
+Then commit and reboot Streamlit.
