@@ -9,7 +9,7 @@ import streamlit as st
 
 import optimizer_core as core
 
-APP_TITLE = "Dynamic Duo Cleaning - Schedule Planner v17"
+APP_TITLE = "Dynamic Duo Cleaning - Schedule Planner v19"
 
 
 def safe_cols(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
@@ -137,7 +137,7 @@ def render_team_setup(cleaners_raw: pd.DataFrame, crews_raw: pd.DataFrame) -> pd
         speed = st.slider("Team speed factor", 1.0, 4.0, value=float(max(1, len(members))), step=0.25, help="2 cleaners usually finish a 4-hour one-person job in about 2 hours.")
         if st.button("Add this team for current run", disabled=len(members) < 2):
             final_name = team_name.strip() or "/".join(members)
-            st.session_state.setdefault("temp_crews_v17", []).append({
+            st.session_state.setdefault("temp_crews_v19", []).append({
                 "resource_name": final_name, "members": ";".join(members), "team_type": team_type,
                 "available_days": ",".join(days), "base_address": "", "can_split_after_job": "No" if team_type == "Fixed" else "Yes",
                 "always_together": "Yes" if team_type == "Fixed" else "No", "carpool": "Yes", "max_jobs_per_day": 4,
@@ -160,8 +160,8 @@ def render_team_setup(cleaners_raw: pd.DataFrame, crews_raw: pd.DataFrame) -> pd
     pieces = []
     if crews_raw is not None and not crews_raw.empty:
         pieces.append(crews_raw)
-    if st.session_state.get("temp_crews_v17"):
-        pieces.append(pd.DataFrame(st.session_state["temp_crews_v17"]))
+    if st.session_state.get("temp_crews_v19"):
+        pieces.append(pd.DataFrame(st.session_state["temp_crews_v19"]))
     if not pair_rows.empty:
         pieces.append(pair_rows)
     if not pieces:
@@ -170,7 +170,7 @@ def render_team_setup(cleaners_raw: pd.DataFrame, crews_raw: pd.DataFrame) -> pd
     with st.expander("Current teams available to the optimizer", expanded=False):
         st.dataframe(safe_cols(combined, ["resource_name", "members", "team_type", "available_days", "productivity_multiplier", "always_together"]), use_container_width=True, hide_index=True)
         if st.button("Clear manual temporary teams"):
-            st.session_state["temp_crews_v17"] = []
+            st.session_state["temp_crews_v19"] = []
             st.rerun()
     return combined
 
@@ -209,7 +209,7 @@ def render_job_controls(bookings_raw: pd.DataFrame, resource_names: List[str]) -
                 "priority": st.column_config.SelectboxColumn("Priority", options=["VIP", "High", "Normal", "Low"]),
                 "time_window": st.column_config.SelectboxColumn("Time window", options=["Flexible", "Morning", "Afternoon", "Fixed"]),
             },
-            key="job_controls_v17",
+            key="job_controls_v19",
         )
     return apply_booking_editor(bookings_raw, edited)
 

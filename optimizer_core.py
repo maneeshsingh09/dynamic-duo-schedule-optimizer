@@ -1,5 +1,5 @@
 """
-Dynamic Duo Cleaning - Schedule Optimizer v17
+Dynamic Duo Cleaning - Schedule Optimizer v19
 
 Run locally:
     pip install -r requirements.txt
@@ -36,7 +36,7 @@ try:
 except Exception:  # pragma: no cover
     pdk = None
 
-APP_TITLE = "Dynamic Duo Cleaning - Schedule Optimizer v17"
+APP_TITLE = "Dynamic Duo Cleaning - Schedule Optimizer v19"
 DEFAULT_START = "08:30"
 DEFAULT_END = "17:00"
 DEFAULT_MIN_GAP_MINUTES = 30
@@ -1641,67 +1641,398 @@ def evaluate_candidate(row: pd.Series, resource: Dict[str, Any], d: date, schedu
     }
 
 
+
+def provider_names_from_value(value: Any) -> List[str]:
+    """Parse BookingKoala Provider/team values into clean human names.
+
+    Examples:
+      "6460: Billy Taylor, 6569: Eduardo Lopez" -> ["Billy Taylor", "Eduardo Lopez"]
+      "Isabel Miranda / Jacqueline Lopez" -> ["Isabel Miranda", "Jacqueline Lopez"]
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return []
+    raw = str(value).strip()
+    if not raw:
+        return []
+    raw = re.sub(r"\b\d+\s*:\s*", "", raw)
+    raw = re.sub(r"\bpair\b\s*[-:]?", "", raw, flags=re.I).strip()
+    raw = re.sub(r"\band\b", ",", raw, flags=re.I)
+    parts = [x.strip(" -\t\n\r") for x in re.split(r"[,;/|+&]+", raw) if x.strip(" -\t\n\r")]
+    # Avoid treating addresses or empty placeholders as people.
+    names = []
+    for part in parts:
+        if not part or re.search(r"\d{3,}", part):
+            continue
+        if part.lower() in {"unassigned", "none", "nan"}:
+            continue
+        names.append(part)
+    return names
+
+
+def person_key_variants(name: str) -> List[str]:
+    clean = re.sub(r"[^A-Za-z\s'-]", " ", str(name or "")).strip()
+    tokens = [t for t in re.split(r"\s+", clean) if t]
+    variants = []
+    if clean:
+        variants.append(key(clean))
+    if tokens:
+        variants.append(key(tokens[0]))
+    return [v for v in variants if v]
+
+
+def provider_first_keys(value: Any) -> List[str]:
+    out: List[str] = []
+    for name in provider_names_from_value(value):
+        variants = person_key_variants(name)
+        if variants:
+            out.append(variants[-1])  # first-name key is usually most stable across BookingKoala/GSheets.
+    return out
+
+
+def match_original_resource(row: pd.Series, resources: pd.DataFrame) -> Dict[str, Any]:
+    """Find the resource that represents the BookingKoala provider/team.
+
+    We intentionally match by first-name keys too, because BookingKoala exports full names
+    such as "Billy Taylor" while the cleaner master often stores "Billy".
+    """
+    provider_value = row.get("assigned_workers", "")
+    names = provider_names_from_value(provider_value)
+    first_keys = set(provider_first_keys(provider_value))
+    full_keys = set()
+    for n in names:
+        full_keys.update(person_key_variants(n))
+
+    if resources is not None and not resources.empty and first_keys:
+        best = None
+        best_score = -1
+        for _, r in resources.iterrows():
+            member_keys = set(str(x) for x in (r.get("member_keys") or []))
+            # Also include resource key and first token of resource/member display for fuzzy matching.
+            candidate_keys = set(member_keys)
+            candidate_keys.add(str(r.get("resource_key", "")))
+            for m in split_list(r.get("members", "")):
+                candidate_keys.update(person_key_variants(m))
+            score = len(first_keys.intersection(candidate_keys))
+            # Exact team size match gets a small boost.
+            if score > 0 and len(first_keys) == int(r.get("member_count", len(member_keys)) or len(member_keys)):
+                score += 2
+            if score > best_score:
+                best_score = score
+                best = r.to_dict()
+        if best is not None and best_score > 0:
+            return best
+
+    # Fallback manual resource: preserves every BookingKoala row even if the cleaner
+    # is not in the master list yet (example: Chelsey). This prevents silent dropped jobs.
+    if names:
+        display = "/".join([n.split()[0] if len(names) > 1 else n for n in names])
+        member_keys = provider_first_keys(provider_value) or [key(display)]
+        members = ", ".join(names)
+    else:
+        display = "Unassigned/Manual"
+        member_keys = ["manual_unassigned"]
+        members = display
+    return {
+        "resource": display,
+        "resource_key": "bk_" + key(display),
+        "resource_type": "BookingKoala baseline",
+        "members": members,
+        "member_keys": member_keys,
+        "member_count": max(1, len(member_keys)),
+        "base_address": "",
+        "available_day_list": WEEKDAY_ORDER,
+        "max_jobs_per_day": 99,
+        "max_hours_per_day": 24,
+        "start_min": 0,
+        "end_min": 24 * 60,
+        "hourly_cost": 0.0,
+        "productivity_multiplier": max(1, len(member_keys)),
+        "can_split_after_job": True,
+        "always_together": len(member_keys) > 1,
+        "carpool": True,
+        "team_type": "BookingKoala",
+    }
+
+
+def make_assignment_from_row(row: pd.Series, resource: Dict[str, Any], d: date, start: int, travel_miles: float, travel_minutes: float, positioning_miles: float, positioning_minutes: float, min_gap_minutes: int, mileage_cost: float, travel_hour_cost: float, score_note: str = "BookingKoala baseline") -> Dict[str, Any]:
+    workers = max(1, int(resource.get("member_count", row.get("bookingkoala_worker_count", 1)) or 1))
+    # BookingKoala Estimated job length is total one-person labor time.
+    duration = int(math.ceil(float(row.get("job_mins", 150) or 150) / workers + int(row.get("buffer_mins", 0) or 0)))
+    end = start + duration
+    labor_cost = (duration / 60) * float(resource.get("hourly_cost", 0.0) or 0.0)
+    travel_cost = float(travel_miles) * mileage_cost + (float(travel_minutes) / 60) * travel_hour_cost
+    profit = float(row.get("job_price_num", 0.0) or 0.0) - labor_cost - travel_cost if float(row.get("job_price_num", 0.0) or 0.0) > 0 else math.nan
+    return {
+        "resource": resource.get("resource", "Manual"),
+        "resource_key": resource.get("resource_key", key(resource.get("resource", "Manual"))),
+        "resource_type": resource.get("resource_type", "BookingKoala baseline"),
+        "members": resource.get("members", resource.get("resource", "")),
+        "member_keys": list(resource.get("member_keys", [])),
+        "date": d,
+        "day": DAY_LABEL[date_to_day(d)],
+        "client": row.get("client"),
+        "address": row.get("address"),
+        "city": row.get("city"),
+        "cleaning_type": row.get("cleaning_type"),
+        "priority": row.get("priority") or "Normal",
+        "time_window": row.get("time_window_label"),
+        "start_min": int(start),
+        "end_min": int(end),
+        "start": minutes_to_time(start),
+        "end": minutes_to_time(end),
+        "duration_mins": int(duration),
+        "duration_hours": round(duration / 60, 2),
+        "travel_miles": round(float(travel_miles), 1),
+        "travel_minutes": round(float(travel_minutes), 0),
+        "positioning_miles_not_counted": round(float(positioning_miles), 1),
+        "positioning_minutes_not_counted": round(float(positioning_minutes), 0),
+        "mileage_policy": "First and last commute excluded; only job-to-job miles count",
+        "gap_after_prev_mins": int(min_gap_minutes) if travel_miles > 0 or travel_minutes > 0 else 0,
+        "bookingkoala_duration_mins": round(float(row.get("bookingkoala_duration_mins", 0) or 0), 0),
+        "bookingkoala_worker_count": int(row.get("bookingkoala_worker_count", 1) or 1),
+        "assigned_worker_count": workers,
+        "team_decision": ("Team" if workers >= 2 else "Solo"),
+        "original_person_hours": round(float(row.get("job_mins", 0) or 0) / 60, 2),
+        "duration_source": row.get("duration_source", ""),
+        "job_price": float(row.get("job_price_num", 0.0) or 0.0),
+        "labor_cost": round(labor_cost, 2),
+        "travel_cost": round(travel_cost, 2),
+        "profit_score": round(profit, 2) if not math.isnan(profit) else "",
+        "buffer_mins": int(row.get("buffer_mins", 0) or 0),
+        "buffer_source": row.get("buffer_source", ""),
+        "time_learning_note": row.get("time_learning_note", ""),
+        "risk_level": row.get("risk_level", "") or row.get("difficulty_level", ""),
+        "score": 0.0,
+        "score_notes": score_note,
+        "point_key": f"job::{row['instance_id']}",
+        "instance_id": row.get("instance_id"),
+        "can_shift": bool(row.get("can_shift_bool")),
+        "anchor_date": row.get("candidate_anchor_date"),
+    }
+
+
+def recompute_job_to_job_miles(schedule_rows: List[Dict[str, Any]], miles: List[List[float]], minutes: List[List[float]], point_idx: Dict[str, int], min_gap_minutes: int, mileage_cost: float, travel_hour_cost: float) -> List[Dict[str, Any]]:
+    """Recalculate counted mileage using only job -> job legs.
+
+    Home/base -> first job and last job -> home are intentionally excluded from counted miles.
+    """
+    if not schedule_rows:
+        return schedule_rows
+    df = pd.DataFrame(schedule_rows)
+    output: List[Dict[str, Any]] = []
+    for (_, _), group in df.groupby(["resource_key", "date"], sort=False):
+        group = group.sort_values("start_min")
+        prev = None
+        for _, rr in group.iterrows():
+            r = rr.to_dict()
+            if prev is None:
+                r["travel_miles"] = 0.0
+                r["travel_minutes"] = 0.0
+                r["gap_after_prev_mins"] = 0
+            else:
+                from_key = str(prev.get("point_key", ""))
+                to_key = str(r.get("point_key", ""))
+                mi = 0.0
+                mins = 0.0
+                if from_key in point_idx and to_key in point_idx:
+                    mi = float(miles[point_idx[from_key]][point_idx[to_key]])
+                    mins = float(minutes[point_idx[from_key]][point_idx[to_key]])
+                    if math.isinf(mi):
+                        mi = 0.0
+                    if math.isinf(mins):
+                        mins = 0.0
+                r["travel_miles"] = round(mi, 1)
+                r["travel_minutes"] = round(mins, 0)
+                r["gap_after_prev_mins"] = int(min_gap_minutes)
+                # Recompute travel cost/profit based only on counted job-to-job travel.
+                travel_cost = mi * mileage_cost + (mins / 60.0) * travel_hour_cost
+                r["travel_cost"] = round(travel_cost, 2)
+                try:
+                    price = float(r.get("job_price", 0) or 0)
+                    labor = float(r.get("labor_cost", 0) or 0)
+                    r["profit_score"] = round(price - labor - travel_cost, 2) if price > 0 else ""
+                except Exception:
+                    pass
+            output.append(r)
+            prev = r
+    return output
+
+
+def insertion_added_miles(route: List[Dict[str, Any]], job_key: str, position: int, miles: List[List[float]], point_idx: Dict[str, int]) -> float:
+    """Added counted miles if a new job is inserted at a route position.
+
+    Since first commute and return home are excluded:
+      - inserting as only/first job has zero previous-leg cost, but may affect next leg
+      - inserting between jobs replaces prev->next with prev->new + new->next
+      - inserting at end adds prev->new only
+    """
+    if job_key not in point_idx:
+        return math.inf
+    if not route:
+        return 0.0
+    def dist(a: str, b: str) -> float:
+        if a not in point_idx or b not in point_idx:
+            return math.inf
+        v = float(miles[point_idx[a]][point_idx[b]])
+        return v if not math.isinf(v) else math.inf
+    n = len(route)
+    if position <= 0:
+        # First job's incoming leg is ignored. New first only creates new->old_first instead of no prior leg to old_first.
+        return dist(job_key, str(route[0].get("point_key", "")))
+    if position >= n:
+        return dist(str(route[-1].get("point_key", "")), job_key)
+    prev_key = str(route[position - 1].get("point_key", ""))
+    next_key = str(route[position].get("point_key", ""))
+    return dist(prev_key, job_key) + dist(job_key, next_key) - dist(prev_key, next_key)
+
+
 def optimize_schedule(bookings_inst: pd.DataFrame, resources: pd.DataFrame, dates: List[date], exceptions: pd.DataFrame, miles: List[List[float]], minutes: List[List[float]], point_idx: Dict[str, int], area_memory: pd.DataFrame, hours_are_person_hours: bool, mileage_cost: float, travel_hour_cost: float, min_gap_minutes: int = DEFAULT_MIN_GAP_MINUTES) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[Tuple[str, date], List[Dict[str, Any]]], Dict[Tuple[str, date], List[Tuple[int, int, str]]]]:
+    """Baseline-protected scheduler.
+
+    v19 changes the scheduler philosophy:
+      1. Import and preserve every BookingKoala job as the baseline plan.
+      2. Count only job-to-job miles. Home/base -> first job and last job -> home are excluded.
+      3. Do not silently drop jobs. Unknown providers become manual BookingKoala resources.
+      4. Use route insertion for truly new/unscheduled bookings instead of reshuffling the whole week.
+    """
     schedules: Dict[Tuple[str, date], List[Dict[str, Any]]] = {}
-    member_events: Dict[Tuple[str, date], List[Tuple[int, int, str]]] = {}
+    member_events: Dict[Tuple[str, date], List[Tuple[int, int, str, str]]] = {}
     assigned: List[Dict[str, Any]] = []
     unassigned: List[Dict[str, Any]] = []
 
     if bookings_inst.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), schedules, member_events
 
-    sort_df = bookings_inst.copy()
-    sort_df["fixed_sort"] = sort_df["fixed_time_bool"].apply(lambda x: 0 if x else 1)
-    sort_df["lock_sort"] = sort_df["lock_resource_bool"].apply(lambda x: 0 if x else 1)
-    # Process day-by-day and keep cities loosely together. This is still fast,
-    # but behaves more like a dispatcher: fixed/locked/high-priority jobs are
-    # placed first, then flexible jobs are pulled into existing clusters.
-    sort_df["city_sort"] = sort_df.get("city", "").astype(str).str.lower()
-    sort_df = sort_df.sort_values(
-        ["candidate_anchor_date", "priority_rank", "fixed_sort", "lock_sort", "city_sort", "earliest_min", "job_mins"],
-        ascending=[True, True, True, True, True, True, False],
-    )
+    baseline_rows: List[Dict[str, Any]] = []
+    new_rows: List[pd.Series] = []
 
-    for _, row in sort_df.iterrows():
-        best: Optional[Dict[str, Any]] = None
-        best_fail_reasons: List[str] = []
-        cdates = candidate_dates_for_booking(row, dates)
-        for d in cdates:
-            for _, res_row in resources.iterrows():
-                resource = res_row.to_dict()
-                ok, cand = evaluate_candidate(row, resource, d, schedules, member_events, exceptions, miles, minutes, point_idx, area_memory, hours_are_person_hours, mileage_cost, travel_hour_cost, min_gap_minutes)
-                if ok:
-                    if best is None or float(cand["score"]) < float(best["score"]):
-                        best = cand
-                else:
-                    reason = cand.get("reason", "Not feasible")
-                    if reason not in best_fail_reasons and len(best_fail_reasons) < 5:
-                        best_fail_reasons.append(reason)
-        if best:
-            schedules.setdefault((best["resource_key"], best["date"]), []).append(best)
-            schedules[(best["resource_key"], best["date"])].sort(key=lambda x: x["start_min"])
-            for m in best["member_keys"]:
-                member_events.setdefault((m, best["date"]), []).append((best["start_min"], best["end_min"], str(best["client"]), str(best.get("point_key", ""))))
-            assigned.append(best)
+    for _, row in bookings_inst.iterrows():
+        d = row.get("candidate_anchor_date")
+        if isinstance(d, pd.Timestamp):
+            d = d.date()
+        if not isinstance(d, date):
+            d = row.get("service_date_parsed")
+            if isinstance(d, pd.Timestamp):
+                d = d.date()
+        scheduled_start = row.get("scheduled_start_min", math.nan)
+        has_bk_provider = bool(str(row.get("assigned_workers", "")).strip())
+        has_scheduled_time = not pd.isna(scheduled_start)
+        if isinstance(d, date) and has_bk_provider and has_scheduled_time:
+            resource = match_original_resource(row, resources)
+            row_dict = make_assignment_from_row(
+                row=row,
+                resource=resource,
+                d=d,
+                start=int(scheduled_start),
+                travel_miles=0.0,
+                travel_minutes=0.0,
+                positioning_miles=0.0,
+                positioning_minutes=0.0,
+                min_gap_minutes=min_gap_minutes,
+                mileage_cost=mileage_cost,
+                travel_hour_cost=travel_hour_cost,
+                score_note="Kept from BookingKoala baseline; no auto-reshuffle",
+            )
+            baseline_rows.append(row_dict)
         else:
-            unassigned.append({
-                "client": row.get("client"),
-                "address": row.get("address"),
-                "city": row.get("city"),
-                "anchor_date": row.get("candidate_anchor_date"),
-                "priority": row.get("priority") or "Normal",
-                "reason": "; ".join(best_fail_reasons) or "No feasible cleaner/team/date found",
-                "suggestion": "Use Emergency Rescue Mode: reassign, move a low-priority job, or offer a flexible-date discount.",
-                "instance_id": row.get("instance_id"),
-            })
+            new_rows.append(row)
 
+    # Sort baseline by actual time and compute the counted job-to-job miles.
+    baseline_rows = recompute_job_to_job_miles(baseline_rows, miles, minutes, point_idx, min_gap_minutes, mileage_cost, travel_hour_cost)
+
+    # Seed route/member state from baseline. This is what prevents new bookings from being inserted
+    # without considering existing/pending future jobs.
+    for r in baseline_rows:
+        schedules.setdefault((str(r["resource_key"]), r["date"]), []).append(r)
+        for m in (r.get("member_keys") or []):
+            member_events.setdefault((str(m), r["date"]), []).append((int(r["start_min"]), int(r["end_min"]), str(r.get("client", "")), str(r.get("point_key", ""))))
+        assigned.append(r)
+    for k in list(schedules.keys()):
+        schedules[k] = sorted(schedules[k], key=lambda x: x["start_min"])
+    for k in list(member_events.keys()):
+        member_events[k] = sorted(member_events[k], key=lambda x: x[0])
+
+    # Insert only truly new/unscheduled jobs into the existing baseline routes.
+    # This is the daily live-booking behavior: find the least added job-to-job miles.
+    if new_rows:
+        temp_df = pd.DataFrame([r.to_dict() for r in new_rows])
+        temp_df["priority_rank"] = temp_df.get("priority_rank", 2)
+        temp_df = temp_df.sort_values(["priority_rank", "job_mins"], ascending=[True, False])
+        for _, row in temp_df.iterrows():
+            best: Optional[Dict[str, Any]] = None
+            best_fail_reasons: List[str] = []
+            cdates = candidate_dates_for_booking(row, dates)
+            for d in cdates:
+                for _, res_row in resources.iterrows():
+                    resource = res_row.to_dict()
+                    ok, cand = evaluate_candidate(row, resource, d, schedules, member_events, exceptions, miles, minutes, point_idx, area_memory, hours_are_person_hours, mileage_cost, travel_hour_cost, min_gap_minutes)
+                    if ok:
+                        # Reinforce insertion thinking: prefer the option that adds the least counted route miles,
+                        # not simply the closest cleaner base.
+                        route = schedules.get((resource["resource_key"], d), [])
+                        job_key = f"job::{row['instance_id']}"
+                        route_sorted = sorted(route, key=lambda x: x.get("start_min", 0))
+                        pos = sum(1 for r in route_sorted if int(r.get("start_min", 0)) <= int(cand.get("start_min", 0)))
+                        added = insertion_added_miles(route_sorted, job_key, pos, miles, point_idx)
+                        cand["added_route_miles"] = round(added if not math.isinf(added) else float(cand.get("travel_miles", 0)), 1)
+                        cand["score"] = round(float(cand.get("score", 0)) + min(cand["added_route_miles"], 40) * 2.5, 2)
+                        cand["score_notes"] = "; ".join([x for x in [cand.get("score_notes", ""), "Inserted into existing future schedule"] if x])
+                        if best is None or float(cand["score"]) < float(best["score"]):
+                            best = cand
+                    else:
+                        reason = cand.get("reason", "Not feasible")
+                        if reason not in best_fail_reasons and len(best_fail_reasons) < 5:
+                            best_fail_reasons.append(reason)
+            if best:
+                schedules.setdefault((best["resource_key"], best["date"]), []).append(best)
+                schedules[(best["resource_key"], best["date"])] = sorted(schedules[(best["resource_key"], best["date"])], key=lambda x: x["start_min"])
+                for m in best["member_keys"]:
+                    member_events.setdefault((m, best["date"]), []).append((best["start_min"], best["end_min"], str(best["client"]), str(best.get("point_key", ""))))
+                assigned.append(best)
+            else:
+                unassigned.append({
+                    "client": row.get("client"),
+                    "address": row.get("address"),
+                    "city": row.get("city"),
+                    "anchor_date": row.get("candidate_anchor_date"),
+                    "priority": row.get("priority") or "Normal",
+                    "reason": "; ".join(best_fail_reasons) or "No feasible insertion found",
+                    "suggestion": "Add manually or widen date/time window. This row was not silently dropped.",
+                    "instance_id": row.get("instance_id"),
+                })
+
+    # Recompute counted route miles again after inserting new jobs.
+    assigned = recompute_job_to_job_miles(assigned, miles, minutes, point_idx, min_gap_minutes, mileage_cost, travel_hour_cost)
     schedule_df = pd.DataFrame(assigned)
     if not schedule_df.empty:
         schedule_df = schedule_df.sort_values(["date", "resource", "start_min"])
     unassigned_df = pd.DataFrame(unassigned)
     alerts_df = build_alerts(schedule_df, resources, miles, minutes, point_idx, mileage_cost)
-    return schedule_df, unassigned_df, alerts_df, schedules, member_events
 
+    # Add cluster diagnostics: bad jumps that should be considered for future moves.
+    extra_alerts: List[Dict[str, Any]] = []
+    if not schedule_df.empty:
+        for (rk, d), group in schedule_df.groupby(["resource_key", "date"]):
+            group = group.sort_values("start_min")
+            for _, r in group.iterrows():
+                try:
+                    mi = float(r.get("travel_miles", 0) or 0)
+                except Exception:
+                    mi = 0.0
+                if mi >= 18:
+                    extra_alerts.append({
+                        "type": "Bad cluster jump",
+                        "severity": "High" if mi >= 25 else "Medium",
+                        "date": d,
+                        "resource": r.get("resource", ""),
+                        "client": r.get("client", ""),
+                        "message": f"{mi:.1f} job-to-job miles before this cleaning. This route is not a tight cluster.",
+                        "advice": "Keep only if fixed/confirmed. For future booking, group this city with a closer route/day.",
+                    })
+    if extra_alerts:
+        alerts_df = pd.concat([alerts_df, pd.DataFrame(extra_alerts)], ignore_index=True) if alerts_df is not None and not alerts_df.empty else pd.DataFrame(extra_alerts)
+
+    return schedule_df, unassigned_df, alerts_df, schedules, member_events
 
 def build_alerts(schedule: pd.DataFrame, resources: pd.DataFrame, miles: List[List[float]], minutes: List[List[float]], point_idx: Dict[str, int], mileage_cost: float) -> pd.DataFrame:
     alerts: List[Dict[str, Any]] = []

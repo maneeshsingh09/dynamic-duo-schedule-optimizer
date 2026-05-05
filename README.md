@@ -1,4 +1,4 @@
-# Dynamic Duo Cleaning - Schedule Planner v17
+# Dynamic Duo Cleaning - Schedule Planner v19
 
 This version changes the app from only a weekly optimizer into a live future scheduling planner.
 
@@ -14,7 +14,7 @@ This version changes the app from only a weekly optimizer into a live future sch
 
 ## Google Sheet tabs
 
-Existing tabs still work. v17 will create these automatically if they do not exist:
+Existing tabs still work. v19 will create these automatically if they do not exist:
 
 - Live Bookings
 - Booking Decisions
@@ -41,7 +41,7 @@ Replace at least:
 
 Then commit and reboot Streamlit.
 
-## v18 changes: cluster-first mileage policy
+## v19 changes: cluster-first mileage policy
 
 This version changes the mileage logic to match Dynamic Duo Cleaning's preferred reporting:
 
@@ -51,3 +51,12 @@ This version changes the mileage logic to match Dynamic Duo Cleaning's preferred
 - The optimizer still uses base-to-first-job distance as a light positioning signal so a cleaner is not assigned to a completely unreasonable first stop, but it does not appear in daily mileage totals or travel cost.
 - A `positioning_miles_not_counted` column is shown for review/debugging.
 - Scoring now penalizes long job-to-job jumps and rewards tighter clusters, so the app behaves more like a dispatcher grouping nearby jobs.
+
+
+## v19 baseline + cluster logic update
+
+- Preserves every BookingKoala row as the baseline schedule when Provider/team and start time are present.
+- Unknown providers are kept as manual BookingKoala resources instead of being dropped.
+- Mileage now counts only job-to-job travel. Cleaner home/base to first job and last job to home are excluded.
+- New/pending bookings are inserted into existing future routes by least added job-to-job miles.
+- Long job-to-job jumps are flagged as bad cluster jumps for future rescheduling decisions.
