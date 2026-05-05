@@ -223,7 +223,7 @@ def route_card_html(resource: str, r: pd.DataFrame) -> str:
         jobs_html += (
             f"<div class='dd-job'><b>{row.get('start','')}–{row.get('end','')}</b> · "
             f"{row.get('client','')}<br><span style='color:#666'>{row.get('city','')} · {row.get('cleaning_type','')} · "
-            f"{row.get('duration_hours','')} hrs · {row.get('travel_miles','')} mi before · gap {row.get('gap_after_prev_mins',0)} min</span></div>"
+            f"{row.get('duration_hours','')} hrs · {row.get('travel_miles','')} job-to-job mi · gap {row.get('gap_after_prev_mins',0)} min</span></div>"
         )
     return (
         f"<div class='dd-route'><div class='dd-resource'>{resource}</div>"
@@ -235,7 +235,7 @@ def route_card_html(resource: str, r: pd.DataFrame) -> str:
 
 def render_calendar_overview(schedule: pd.DataFrame, dates: List[date]) -> None:
     st.subheader("Weekly schedule calendar")
-    st.caption("Each day shows cleaner/team routes, job order, travel miles, and work hours.")
+    st.caption("Each day shows cleaner/team routes, job order, counted job-to-job miles, and work hours. Home→first job and last job→home are intentionally excluded.")
     if schedule is None or schedule.empty:
         st.info("No scheduled jobs yet.")
         return
@@ -250,7 +250,7 @@ def render_calendar_overview(schedule: pd.DataFrame, dates: List[date]) -> None:
             label = pd.to_datetime(str(d)).strftime("%a, %b %d")
             total_miles = float(day_df["travel_miles"].astype(float).sum()) if not day_df.empty and "travel_miles" in day_df else 0.0
             with col:
-                html = f"<div class='dd-day'><div class='dd-day-title'>{label}</div><div class='dd-meta'>{len(day_df)} jobs · {day_df['resource'].nunique() if not day_df.empty else 0} routes · {total_miles:.1f} mi</div>"
+                html = f"<div class='dd-day'><div class='dd-day-title'>{label}</div><div class='dd-meta'>{len(day_df)} jobs · {day_df['resource'].nunique() if not day_df.empty else 0} routes · {total_miles:.1f} job-to-job mi</div>"
                 for resource in day_df.sort_values(["resource", "start_min"])["resource"].dropna().astype(str).unique():
                     r = day_df[day_df["resource"].astype(str) == resource]
                     html += route_card_html(resource, r)
@@ -269,8 +269,8 @@ def render_approval_calendar(schedule: pd.DataFrame, dates: List[date]) -> pd.Da
             continue
         day_label = pd.to_datetime(str(d)).strftime("%A, %b %d")
         total_miles = float(day_df["travel_miles"].astype(float).sum()) if "travel_miles" in day_df else 0.0
-        with st.expander(f"{day_label} — approve {len(day_df)} jobs · {total_miles:.1f} miles", expanded=False):
-            display_cols = ["manager_status", "lock_assignment", "manager_note", "resource", "start", "end", "client", "city", "duration_hours", "bookingkoala_duration_mins", "bookingkoala_worker_count", "original_person_hours", "gap_after_prev_mins", "travel_miles", "profit_score", "duration_source", "instance_id"]
+        with st.expander(f"{day_label} — approve {len(day_df)} jobs · {total_miles:.1f} job-to-job miles", expanded=False):
+            display_cols = ["manager_status", "lock_assignment", "manager_note", "resource", "start", "end", "client", "city", "duration_hours", "bookingkoala_duration_mins", "bookingkoala_worker_count", "original_person_hours", "gap_after_prev_mins", "travel_miles", "positioning_miles_not_counted", "profit_score", "duration_source", "instance_id"]
             cols = [c for c in display_cols if c in day_df.columns]
             edited = st.data_editor(
                 day_df[cols],
@@ -306,7 +306,7 @@ def render_problem_summary(unassigned: pd.DataFrame, alerts: pd.DataFrame, price
     with st.expander("Problem jobs / price warnings", expanded=False):
         core.display_df("Unassigned jobs", unassigned)
         core.display_df("Route warnings", safe_cols(alerts, ["date", "resource", "client", "type", "severity", "message", "advice"]))
-        core.display_df("Price suggestions", safe_cols(price_suggestions, ["client", "resource", "date", "suggestion", "reason", "profit_score", "travel_miles"]))
+        core.display_df("Price suggestions", safe_cols(price_suggestions, ["client", "resource", "date", "suggestion", "reason", "profit_score", "travel_miles", "positioning_miles_not_counted"]))
         core.display_df("Actual time learning applied", time_learning)
 
 
@@ -509,7 +509,7 @@ def render_live_booking_planner(resources: pd.DataFrame, dates: List[date], sche
                 <div class='dd-best'>
                 <div class='dd-day-title'>{label}: {opt['day']} · {opt['resource']}</div>
                 <div class='dd-meta'>{opt['start']}–{opt['end']} · {opt.get('city','')}</div>
-                <span class='dd-pill'>{opt['travel_miles']} mi before job</span>
+                <span class='dd-pill'>{opt['travel_miles']} job-to-job mi added</span>
                 <span class='dd-pill'>{opt['duration_hours']} work hrs</span>
                 <span class='dd-pill'>{int(opt.get('assigned_worker_count', 1) or 1)} cleaner(s)</span>
                 <span class='dd-pill'>Profit {clean_money(opt.get('profit_score',''))}</span>
@@ -522,7 +522,7 @@ def render_live_booking_planner(resources: pd.DataFrame, dates: List[date], sche
 
     labels = []
     for idx, r in sug_df.head(12).reset_index(drop=True).iterrows():
-        labels.append(f"#{idx+1} {r.get('day')} {r.get('start')}–{r.get('end')} · {r.get('resource')} · {r.get('travel_miles')} mi")
+        labels.append(f"#{idx+1} {r.get('day')} {r.get('start')}–{r.get('end')} · {r.get('resource')} · {r.get('travel_miles')} job-to-job mi")
     selected_label = st.selectbox("Choose slot to save/hold", labels)
     selected_index = labels.index(selected_label)
     selected = sug_df.head(12).reset_index(drop=True).iloc[selected_index].to_dict()
@@ -751,7 +751,7 @@ def main() -> None:
         m1.metric("Scheduled jobs", len(schedule))
         m2.metric("Unassigned", len(unassigned))
         m3.metric("Cleaner/team routes", used_resources)
-        m4.metric("Drive miles", f"{total_miles:.1f}")
+        m4.metric("Job-to-job miles", f"{total_miles:.1f}")
         if live_bookings_raw is not None and not live_bookings_raw.empty:
             st.caption(f"Live planner is holding/tracking {len(live_bookings_raw)} pending or confirmed booking addition(s) from the shared Google Sheet.")
 

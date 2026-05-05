@@ -40,3 +40,14 @@ Replace at least:
 - README.md
 
 Then commit and reboot Streamlit.
+
+## v18 changes: cluster-first mileage policy
+
+This version changes the mileage logic to match Dynamic Duo Cleaning's preferred reporting:
+
+- Cleaner base/home to the first job is **not counted** in the displayed route miles.
+- Last job back home is **not counted**.
+- Only job-to-job mileage between cleanings is counted.
+- The optimizer still uses base-to-first-job distance as a light positioning signal so a cleaner is not assigned to a completely unreasonable first stop, but it does not appear in daily mileage totals or travel cost.
+- A `positioning_miles_not_counted` column is shown for review/debugging.
+- Scoring now penalizes long job-to-job jumps and rewards tighter clusters, so the app behaves more like a dispatcher grouping nearby jobs.

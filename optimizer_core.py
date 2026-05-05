@@ -1484,11 +1484,23 @@ def evaluate_candidate(row: pd.Series, resource: Dict[str, Any], d: date, schedu
 
     resource_base_key = f"base::{resource['resource_key']}"
     job_key = f"job::{row['instance_id']}"
+    # Mileage policy for Dynamic Duo:
+    # - Do NOT count home/base -> first job as route mileage.
+    # - Do NOT count last job -> home/base.
+    # - Only count job -> job travel inside the workday.
+    # We still look at base -> first job as a light positioning signal so the
+    # first job is not assigned to a completely unreasonable cleaner, but it is
+    # never included in the displayed/paid route miles or travel cost.
+    route_is_empty = len(route) == 0
     last_key = route[-1]["point_key"] if route else resource_base_key
-    travel_miles = miles[point_idx[last_key]][point_idx[job_key]]
-    travel_minutes = minutes[point_idx[last_key]][point_idx[job_key]]
-    if math.isinf(travel_miles) or math.isinf(travel_minutes):
+    raw_miles = miles[point_idx[last_key]][point_idx[job_key]]
+    raw_minutes = minutes[point_idx[last_key]][point_idx[job_key]]
+    if math.isinf(raw_miles) or math.isinf(raw_minutes):
         return False, {"reason": "No route data"}
+    positioning_miles = float(raw_miles) if route_is_empty else 0.0
+    positioning_minutes = float(raw_minutes) if route_is_empty else 0.0
+    travel_miles = 0.0 if route_is_empty else float(raw_miles)
+    travel_minutes = 0.0 if route_is_empty else float(raw_minutes)
     prev_end = route[-1]["end_min"] if route else avail_start
     gap_after_prev = int(min_gap_minutes) if route else 0
     arrival = prev_end + gap_after_prev + int(math.ceil(travel_minutes))
@@ -1543,7 +1555,36 @@ def evaluate_candidate(row: pd.Series, resource: Dict[str, Any], d: date, schedu
             team_penalty -= 8
         elif person_hours >= 4.0 and member_count >= 2:
             team_penalty -= 4
-    score = travel_miles + (travel_minutes / 8) + shift_penalty + priority_penalty + pref_bonus + area_adj + team_penalty
+    # Cluster-first scoring:
+    # 1) For the first job on a route, base distance is only a soft positioning signal.
+    # 2) For later jobs, job-to-job mileage is the strongest signal.
+    # 3) Creating a brand-new route gets a small penalty so nearby jobs are grouped
+    #    instead of being spread across every cleaner.
+    # 4) Bad long job-to-job jumps are penalized heavily.
+    empty_route_penalty = 5.0 if route_is_empty else 0.0
+    positioning_penalty = min(positioning_miles * 0.25, 12.0) if route_is_empty else 0.0
+    long_jump_penalty = 0.0
+    if not route_is_empty:
+        if travel_miles >= 30:
+            long_jump_penalty += 45
+        elif travel_miles >= 22:
+            long_jump_penalty += 28
+        elif travel_miles >= 15:
+            long_jump_penalty += 14
+        elif travel_miles <= 5:
+            long_jump_penalty -= 5
+    score = (
+        travel_miles * 1.8
+        + (travel_minutes / 6)
+        + empty_route_penalty
+        + positioning_penalty
+        + long_jump_penalty
+        + shift_penalty
+        + priority_penalty
+        + pref_bonus
+        + area_adj
+        + team_penalty
+    )
     if str(row.get("time_window_label", "")).lower() in {"fixed", "morning"}:
         score -= 2
 
@@ -1573,6 +1614,9 @@ def evaluate_candidate(row: pd.Series, resource: Dict[str, Any], d: date, schedu
         "duration_hours": round(duration / 60, 2),
         "travel_miles": round(travel_miles, 1),
         "travel_minutes": round(travel_minutes, 0),
+        "positioning_miles_not_counted": round(positioning_miles, 1),
+        "positioning_minutes_not_counted": round(positioning_minutes, 0),
+        "mileage_policy": "First and last commute excluded; only job-to-job miles count",
         "gap_after_prev_mins": gap_after_prev,
         "bookingkoala_duration_mins": round(float(row.get("bookingkoala_duration_mins", 0) or 0), 0),
         "bookingkoala_worker_count": int(row.get("bookingkoala_worker_count", 1) or 1),
@@ -1609,7 +1653,14 @@ def optimize_schedule(bookings_inst: pd.DataFrame, resources: pd.DataFrame, date
     sort_df = bookings_inst.copy()
     sort_df["fixed_sort"] = sort_df["fixed_time_bool"].apply(lambda x: 0 if x else 1)
     sort_df["lock_sort"] = sort_df["lock_resource_bool"].apply(lambda x: 0 if x else 1)
-    sort_df = sort_df.sort_values(["priority_rank", "fixed_sort", "lock_sort", "earliest_min", "job_mins"], ascending=[True, True, True, True, False])
+    # Process day-by-day and keep cities loosely together. This is still fast,
+    # but behaves more like a dispatcher: fixed/locked/high-priority jobs are
+    # placed first, then flexible jobs are pulled into existing clusters.
+    sort_df["city_sort"] = sort_df.get("city", "").astype(str).str.lower()
+    sort_df = sort_df.sort_values(
+        ["candidate_anchor_date", "priority_rank", "fixed_sort", "lock_sort", "city_sort", "earliest_min", "job_mins"],
+        ascending=[True, True, True, True, True, True, False],
+    )
 
     for _, row in sort_df.iterrows():
         best: Optional[Dict[str, Any]] = None
